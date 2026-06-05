@@ -36,4 +36,6 @@ export const bridge = {
   installUpdate: () => invoke<void>("install_update"),
 
   openLog: () => invoke<void>("open_log_cmd"),
+
+  getLog: () => invoke<string>("get_log_cmd"),
 };

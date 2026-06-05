@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { bridge } from "../bridge";
 import type { AppStatus, Screen } from "../types";
 
@@ -12,28 +12,50 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
   const [machineName, setMachineName] = useState(status.machineName);
   const [snapshotCount, setSnapshotCount] = useState(status.snapshotCount);
   const [autostart, setAutostart] = useState(status.autostartEnabled);
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
+  useEffect(() => { setAutostart(status.autostartEnabled); }, [status.autostartEnabled]);
+  const [machineNameSaved, setMachineNameSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [disconnecting, setDisconnecting] = useState(false);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  async function handleSave() {
-    setSaving(true);
-    setError(null);
+  function handleMachineNameChange(value: string) {
+    setMachineName(value);
+    setMachineNameSaved(false);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(async () => {
+      try {
+        await bridge.setMachineName(value);
+        const s = await bridge.getStatus();
+        onStatusChange(s);
+        setMachineNameSaved(true);
+        setTimeout(() => setMachineNameSaved(false), 2000);
+      } catch (e) {
+        setError(String(e));
+      }
+    }, 600);
+  }
+
+  async function handleSnapshotCountChange(value: number) {
+    setSnapshotCount(value);
     try {
-      await Promise.all([
-        bridge.setMachineName(machineName),
-        bridge.setSnapshotCount(snapshotCount),
-        bridge.setAutostart(autostart),
-      ]);
+      await bridge.setSnapshotCount(value);
       const s = await bridge.getStatus();
       onStatusChange(s);
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2500);
     } catch (e) {
       setError(String(e));
-    } finally {
-      setSaving(false);
+    }
+  }
+
+  async function handleAutostartToggle() {
+    const next = !autostart;
+    setAutostart(next);
+    try {
+      await bridge.setAutostart(next);
+      const s = await bridge.getStatus();
+      onStatusChange(s);
+    } catch (e) {
+      setAutostart(!next);
+      setError(String(e));
     }
   }
 
@@ -73,14 +95,21 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
           <label className="text-xs text-muted" htmlFor="machine-name">
             Device name
           </label>
-          <input
-            id="machine-name"
-            type="text"
-            value={machineName}
-            onChange={(e) => setMachineName(e.target.value)}
-            placeholder="e.g. Work Laptop"
-            className="input"
-          />
+          <div className="relative">
+            <input
+              id="machine-name"
+              type="text"
+              value={machineName}
+              onChange={(e) => handleMachineNameChange(e.target.value)}
+              placeholder="e.g. Work Laptop"
+              className="input w-full pr-8"
+            />
+            {machineNameSaved && (
+              <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-success text-sm animate-fade-in">
+                ✓
+              </span>
+            )}
+          </div>
           <p className="text-xs text-muted">
             Used to label your backups. Each device keeps its own name.
           </p>
@@ -101,7 +130,7 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
               min={1}
               max={10}
               value={snapshotCount}
-              onChange={(e) => setSnapshotCount(Number(e.target.value))}
+              onChange={(e) => handleSnapshotCountChange(Number(e.target.value))}
               className="flex-1 accent-accent"
             />
             <span className="w-6 text-center text-sm font-semibold text-white">
@@ -133,17 +162,17 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
           <div>
             <p className="text-sm text-white">Launch at login</p>
             <p className="text-xs text-muted mt-0.5">
-              Start minimised to the system tray when you log in.
+              Start minimized to the system tray when you log in.
             </p>
           </div>
           <button
             type="button"
             role="switch"
-            aria-checked={autostart}
+            aria-checked={autostart ? "true" : "false"}
             aria-label="Launch at login"
-            onClick={() => setAutostart(!autostart)}
+            onClick={handleAutostartToggle}
             className={`
-              relative w-11 h-6 rounded-full transition-colors duration-200
+              relative w-11 h-6 rounded-full transition-colors duration-200 appearance-none outline-none
               ${autostart ? "bg-accent" : "bg-surface-border"}
             `}
           >
@@ -158,29 +187,6 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
         </div>
       )}
 
-      {saved && (
-        <div className="flex items-center gap-2 p-3 bg-success/10 border border-success/20 rounded-xl text-sm text-success animate-fade-in">
-          <span>✓</span>
-          <span>Settings saved</span>
-        </div>
-      )}
-
-      <button
-        type="button"
-        onClick={handleSave}
-        disabled={saving}
-        className="btn-primary w-full"
-      >
-        {saving ? (
-          <>
-            <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-            Saving…
-          </>
-        ) : (
-          "Save settings"
-        )}
-      </button>
-
       {/* Debug / account */}
       <div className="flex flex-col gap-2">
         <div className="divider" />
@@ -189,7 +195,7 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
           onClick={handleOpenLog}
           className="btn-secondary text-xs w-full"
         >
-          Open log file
+          Show logs
         </button>
         <button
           type="button"

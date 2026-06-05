@@ -429,7 +429,7 @@ impl GitHubClient {
         use rand::RngCore;
         let mut key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut key);
-        let b64 = BASE64.encode(&key);
+        let b64 = BASE64.encode(key);
         self.upload_asset(ENCRYPTION_KEY_ASSET, b64.as_bytes(), "text/plain")
             .await?;
         save_encryption_key(&key)?;

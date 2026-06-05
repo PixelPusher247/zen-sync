@@ -12,11 +12,14 @@ pub fn is_zen_running() -> bool {
     let my_uid = sys.process(my_pid).and_then(|p| p.user_id()).cloned();
 
     sys.processes().values().any(|p| {
+        if p.pid() == my_pid {
+            return false;
+        }
         let name = p.name().to_lowercase();
         let name = name.trim_end_matches(".exe");
         let is_zen = name == "zen" || name == "zen browser" || name.starts_with("zen-");
         let is_subprocess = name.contains("helper") || name.contains("crashreporter");
-        if !(is_zen && !is_subprocess) {
+        if !is_zen || is_subprocess {
             return false;
         }
         match (&my_uid, p.user_id()) {

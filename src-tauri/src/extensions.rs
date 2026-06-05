@@ -75,7 +75,7 @@ fn best_icon(addon: &AddonEntry) -> Option<String> {
             }
         }
     }
-    icons.values().next().map(|s| s.clone())
+    icons.values().next().cloned()
 }
 
 /// Parse extensions.json and return user-installed extension info.
@@ -109,7 +109,7 @@ pub fn list_extensions(profile_dir: &Path) -> Result<Vec<ExtensionInfo>, String>
         })
         .collect();
 
-    result.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    result.sort_by_key(|a| a.name.to_lowercase());
     Ok(result)
 }
 
@@ -182,8 +182,8 @@ pub fn merge_extensions(
     }
 
     // Append restored addons that don't exist locally yet
-    let local_ids: std::collections::HashSet<&str> =
-        local.addons.iter().map(|a| a.id.as_str()).collect();
+    let local_ids: std::collections::HashSet<String> =
+        local.addons.iter().map(|a| a.id.clone()).collect();
     for restored_addon in &restored.addons {
         if id_set.contains(restored_addon.id.as_str())
             && !local_ids.contains(restored_addon.id.as_str())

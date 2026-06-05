@@ -102,12 +102,12 @@
   }
 
   .toggle-thumb-off {
-    @apply absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform duration-200;
+    @apply absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform duration-200;
     transform: translateX(2px);
   }
 
   .toggle-thumb-on {
-    @apply absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform duration-200;
+    @apply absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform duration-200;
     transform: translateX(22px);
   }
 

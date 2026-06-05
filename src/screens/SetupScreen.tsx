@@ -53,23 +53,6 @@ export default function SetupScreen({ onConnected }: Props) {
           ))}
         </div>
 
-        {/* OAuth setup note */}
-        <div className="w-full p-3 bg-surface-overlay border border-surface-border rounded-xl text-xs text-muted leading-relaxed">
-          <span className="text-accent font-medium">Before connecting:</span>{" "}
-          create a GitHub OAuth App at{" "}
-          <span className="font-mono text-subtle">
-            github.com/settings/developers
-          </span>{" "}
-          with callback URL{" "}
-          <span className="font-mono text-subtle">
-            http://127.0.0.1
-          </span>
-          , then set{" "}
-          <span className="font-mono text-subtle">GITHUB_CLIENT_ID</span> and{" "}
-          <span className="font-mono text-subtle">GITHUB_CLIENT_SECRET</span>{" "}
-          in your environment or build config.
-        </div>
-
         {error && (
           <div className="w-full p-3 bg-danger/10 border border-danger/20 rounded-xl text-xs text-danger animate-fade-in">
             {error}

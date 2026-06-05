@@ -20,7 +20,7 @@ cargo --version   # e.g. cargo 1.77.0
 ## Step 1 — Fork / clone the repo
 
 ```powershell
-git clone https://github.com/YOUR_USERNAME/zen-sync.git
+git clone https://github.com/PixelPusher247/zen-sync.git
 cd zen-sync
 npm install
 ```
@@ -39,7 +39,7 @@ sharing a password.  You register one OAuth App per deployment (your fork).
    | Field | Value |
    |-------|-------|
    | Application name | `Zen Sync` |
-   | Homepage URL | `https://github.com/YOUR_USERNAME/zen-sync` |
+   | Homepage URL | `https://github.com/PixelPusher247/zen-sync` |
    | Authorization callback URL | `http://127.0.0.1` |
 
 4. Click **Register application**
@@ -100,13 +100,13 @@ Public key: dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXkgAAAA...
   "updater": {
     "pubkey": "PASTE_PUBLIC_KEY_HERE",
     "endpoints": [
-      "https://github.com/YOUR_USERNAME/zen-sync/releases/latest/download/latest.json"
+      "https://github.com/PixelPusher247/zen-sync/releases/latest/download/latest.json"
     ]
   }
 }
 ```
 
-Also replace `YOUR_USERNAME` in the endpoint URL with your GitHub username.
+Also replace `PixelPusher247` in the endpoint URL with your GitHub username.
 
 ---
 
@@ -120,9 +120,10 @@ and add these repository secrets:
 | `OAUTH_CLIENT_ID` | Client ID from Step 2 |
 | `OAUTH_CLIENT_SECRET` | Client secret from Step 2 |
 | `TAURI_SIGNING_PRIVATE_KEY` | Contents of `~/.tauri/zen-sync.key` |
-| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Password you chose when generating the key (leave blank if none) |
 
 > **Tip:** To read the private key file: `Get-Content "$env:USERPROFILE\.tauri\zen-sync.key"`
+>
+> If you did not set a password when generating the key, no `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` secret is needed — the workflow omits it and Tauri defaults to no password.
 
 ---
 

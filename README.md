@@ -6,7 +6,7 @@
 
 **Encrypted Zen Browser profile backups, on demand.**
 
-[![Version](https://img.shields.io/badge/version-0.1.0-7c6af7?style=flat-square)](https://github.com/YOUR_USERNAME/zen-sync/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.1.0-7c6af7?style=flat-square)](https://github.com/PixelPusher247/zen-sync/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078d4?style=flat-square)](#installation)
 [![License](https://img.shields.io/badge/license-MIT-7c6af7?style=flat-square)](LICENSE)
 
@@ -73,7 +73,7 @@ Unlike [Zync](https://github.com/PixelPusher247/zync), there are no background d
 
 ## Installation
 
-Download the latest Windows installer from the [Releases](https://github.com/YOUR_USERNAME/zen-sync/releases/latest) page:
+Download the latest Windows installer from the [Releases](https://github.com/PixelPusher247/zen-sync/releases/latest) page:
 
 | Format | Notes |
 |--------|-------|

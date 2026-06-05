@@ -9,6 +9,7 @@ on:
 env:
   GITHUB_CLIENT_ID: placeholder
   GITHUB_CLIENT_SECRET: placeholder
+  CARGO_NET_RETRY: 10
 
 jobs:
   check:

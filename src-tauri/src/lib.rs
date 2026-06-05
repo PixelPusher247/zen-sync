@@ -89,6 +89,17 @@ pub fn run() {
             let update_store = Arc::new(UpdateStore::new());
             app.manage(update_store.clone());
 
+            // Sync OS autostart state to persisted preference (defaults to false on first run)
+            {
+                use tauri_plugin_autostart::ManagerExt;
+                let autostart_enabled = state.lock().unwrap().local_state.autostart_enabled;
+                if autostart_enabled {
+                    let _ = app.autolaunch().enable();
+                } else {
+                    let _ = app.autolaunch().disable();
+                }
+            }
+
             let tray_menu = setup_tray(app)?;
             app.manage(Arc::new(TrayMenuState { menu: tray_menu }));
 
@@ -161,6 +172,7 @@ pub fn run() {
             get_extensions_with_selection_cmd,
             set_extension_selection_cmd,
             open_log_cmd,
+            get_log_cmd,
             install_update,
         ])
         .run(tauri::generate_context!())
@@ -172,16 +184,10 @@ pub fn run() {
 fn setup_tray(app: &mut tauri::App) -> Result<Menu<tauri::Wry>, Box<dyn std::error::Error>> {
     let open = MenuItem::with_id(app, "open", "Open Zen Sync", true, None::<&str>)?;
     let backup = MenuItem::with_id(app, "backup", "Backup Now", true, None::<&str>)?;
-    let autostart_label = {
-        // Will be set at runtime; initial label before state loads
-        "Enable Launch at Login"
-    };
-    let autostart =
-        MenuItem::with_id(app, "autostart", autostart_label, true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
-    let menu = Menu::with_items(app, &[&open, &backup, &autostart, &sep, &quit])?;
+    let menu = Menu::with_items(app, &[&open, &backup, &sep, &quit])?;
 
     let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray-icon.png"))?;
 
@@ -204,12 +210,6 @@ fn setup_tray(app: &mut tauri::App) -> Result<Menu<tauri::Wry>, Box<dyn std::err
                     if let Err(e) = result {
                         crate::zslog!("[tray] backup failed: {e}");
                     }
-                });
-            }
-            "autostart" => {
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    toggle_autostart_tray(&app).await;
                 });
             }
             "check_updates" => {
@@ -303,36 +303,6 @@ async fn tray_backup(
     Ok(())
 }
 
-async fn toggle_autostart_tray(app: &tauri::AppHandle) {
-    use tauri_plugin_autostart::ManagerExt;
-    let autolaunch = app.autolaunch();
-    let current = autolaunch.is_enabled().unwrap_or(false);
-    if current {
-        let _ = autolaunch.disable();
-        crate::zslog!("[autostart] disabled");
-    } else {
-        let _ = autolaunch.enable();
-        crate::zslog!("[autostart] enabled");
-    }
-    // Update tray item label
-    if let Some(tray) = app.tray_by_id("zen-sync-tray") {
-        if let Some(menu) = tray.menu() {
-            if let Some(item) = menu.get("autostart") {
-                use tauri::menu::MenuItemKind;
-                if let MenuItemKind::MenuItem(mi) = item {
-                    let label = if !current {
-                        "Disable Launch at Login"
-                    } else {
-                        "Enable Launch at Login"
-                    };
-                    let _ = mi.set_text(label);
-                }
-            }
-        }
-    }
-    let _ = app.emit("autostart-changed", !current);
-}
-
 // ── Update handling ───────────────────────────────────────────────────────────
 
 async fn check_for_updates(app: &tauri::AppHandle, manual: bool) {
@@ -409,9 +379,6 @@ fn rebuild_tray_with_update(app: &tauri::AppHandle, version: &str) {
     let Some(backup) = base_menu.menu.get("backup") else {
         return;
     };
-    let Some(autostart) = base_menu.menu.get("autostart") else {
-        return;
-    };
     let Ok(sep2) = PredefinedMenuItem::separator(app) else {
         return;
     };
@@ -426,7 +393,6 @@ fn rebuild_tray_with_update(app: &tauri::AppHandle, version: &str) {
             &sep1,
             &open as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
             &backup as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
-            &autostart as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
             &sep2,
             &quit as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
         ],
@@ -695,6 +661,7 @@ fn set_extension_selection_cmd(
 async fn set_autostart_cmd(
     enabled: bool,
     app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;
     if enabled {
@@ -706,23 +673,42 @@ async fn set_autostart_cmd(
             .disable()
             .map_err(|e| format!("Failed to disable autostart: {e}"))?;
     }
+    {
+        let mut s = state.lock().unwrap();
+        s.local_state.autostart_enabled = enabled;
+        let config_dir = s.config_dir.clone();
+        let _ = s.local_state.save(&config_dir);
+    }
     crate::zslog!("[autostart] set to {enabled}");
     Ok(())
 }
 
 #[tauri::command]
 async fn open_log_cmd(app: tauri::AppHandle) -> Result<(), String> {
-    use tauri_plugin_opener::OpenerExt;
+    use tauri::WebviewWindowBuilder;
+    if let Some(w) = app.get_webview_window("log") {
+        let _ = w.show();
+        let _ = w.set_focus();
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(&app, "log", tauri::WebviewUrl::App("index.html".into()))
+        .title("Zen Sync — Log")
+        .inner_size(700.0, 500.0)
+        .min_inner_size(400.0, 300.0)
+        .resizable(true)
+        .center()
+        .build()
+        .map_err(|e| format!("Cannot open log window: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn get_log_cmd() -> Result<String, String> {
     let path = match logger::path() {
         Some(p) => p.to_path_buf(),
         None => return Err("Logging is not initialised".into()),
     };
-    if !path.exists() {
-        return Err("No log file found yet".into());
-    }
-    app.opener()
-        .open_path(path.to_string_lossy(), None::<&str>)
-        .map_err(|e| format!("Cannot open log file: {e}"))
+    std::fs::read_to_string(&path).map_err(|e| format!("Cannot read log: {e}"))
 }
 
 #[tauri::command]
