@@ -139,7 +139,7 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
           <button
             type="button"
             role="switch"
-            aria-checked={autostart ? "true" : "false"}
+            aria-checked={autostart}
             aria-label="Launch at login"
             onClick={() => setAutostart(!autostart)}
             className={`
