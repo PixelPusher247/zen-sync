@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  GITHUB_CLIENT_ID: placeholder
+  GITHUB_CLIENT_SECRET: placeholder
+
+jobs:
+  check:
+    name: Check + Clippy + Test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Vite build check
+        run: npm run vite:build
+
+      - name: cargo check
+        working-directory: src-tauri
+        run: cargo check
+
+      - name: cargo clippy
+        working-directory: src-tauri
+        run: cargo clippy -- -D warnings
+
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test

@@ -1,0 +1,744 @@
+mod crypto;
+mod extensions;
+mod github;
+mod local_state;
+pub mod logger;
+mod prefs;
+mod profile;
+mod sync;
+mod zen_check;
+
+use std::sync::{Arc, Mutex};
+use tauri::{
+    menu::{Menu, MenuItem, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Emitter, Manager,
+};
+use tauri_plugin_updater::UpdaterExt;
+
+// ── App state ─────────────────────────────────────────────────────────────────
+
+struct AppState {
+    github_client: Option<Arc<github::GitHubClient>>,
+    local_state: local_state::LocalState,
+    config_dir: std::path::PathBuf,
+}
+
+impl AppState {
+    fn machine_id(&self) -> String {
+        // Stable identifier derived from machine name (URL-safe, lowercase)
+        self.local_state
+            .machine_name
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '-' })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string()
+    }
+}
+
+struct TrayMenuState {
+    menu: Menu<tauri::Wry>,
+}
+
+struct UpdateStore {
+    update: tokio::sync::Mutex<Option<tauri_plugin_updater::Update>>,
+    version: std::sync::Mutex<Option<String>>,
+    notes: std::sync::Mutex<Option<String>>,
+}
+
+impl UpdateStore {
+    fn new() -> Self {
+        Self {
+            update: tokio::sync::Mutex::new(None),
+            version: std::sync::Mutex::new(None),
+            notes: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .plugin(tauri_plugin_oauth::init())
+        .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let log_dir = app.path().app_config_dir().unwrap_or_default();
+            crate::logger::init(log_dir.join("zen-sync.log"));
+            crate::zslog!("=== Zen Sync {} starting ===", app.package_info().version);
+
+            let config_dir = app.path().app_config_dir().unwrap_or_default();
+            let ls = local_state::LocalState::load(&config_dir);
+
+            let state = Arc::new(Mutex::new(AppState {
+                github_client: None,
+                local_state: ls,
+                config_dir,
+            }));
+            app.manage(state.clone());
+
+            let update_store = Arc::new(UpdateStore::new());
+            app.manage(update_store.clone());
+
+            let tray_menu = setup_tray(app)?;
+            app.manage(Arc::new(TrayMenuState { menu: tray_menu }));
+
+            // Close button hides to tray instead of quitting
+            let window = app.get_webview_window("main")
+                .ok_or("main window not found")?;
+            let win = window.clone();
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = win.hide();
+                }
+            });
+
+            // Show window on first run (no GitHub token yet)
+            if !github::has_stored_token() {
+                window.show().unwrap();
+                let _ = window.set_focus();
+            }
+
+            // Restore GitHub client from keychain in background
+            {
+                let state_clone = state.clone();
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    match github::GitHubClient::from_keychain().await {
+                        Ok(Some(client)) => {
+                            state_clone.lock().unwrap().github_client =
+                                Some(Arc::new(client));
+                            crate::zslog!("[app] GitHub client restored from keychain");
+                            let _ = app_handle.emit("github-restored", ());
+                            // Show window after successful restore if connected
+                            if let Some(w) = app_handle.get_webview_window("main") {
+                                let _ = w.show();
+                                let _ = w.set_focus();
+                            }
+                        }
+                        Ok(None) => {
+                            crate::zslog!("[app] no stored GitHub token");
+                        }
+                        Err(e) => crate::zslog!("[app] GitHub restore failed: {e}"),
+                    }
+                });
+            }
+
+            // Update check: 5s after launch, then every 24h
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                loop {
+                    check_for_updates(&app_handle, false).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
+                }
+            });
+
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            zen_check::is_zen_running,
+            profile::detect_profile_path,
+            get_status_cmd,
+            connect_github_cmd,
+            disconnect_github_cmd,
+            backup_now_cmd,
+            get_snapshots_cmd,
+            restore_snapshot_cmd,
+            set_machine_name_cmd,
+            set_snapshot_count_cmd,
+            set_autostart_cmd,
+            get_extensions_with_selection_cmd,
+            set_extension_selection_cmd,
+            open_log_cmd,
+            install_update,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running zen-sync");
+}
+
+// ── Tray ──────────────────────────────────────────────────────────────────────
+
+fn setup_tray(app: &mut tauri::App) -> Result<Menu<tauri::Wry>, Box<dyn std::error::Error>> {
+    let open = MenuItem::with_id(app, "open", "Open Zen Sync", true, None::<&str>)?;
+    let backup = MenuItem::with_id(app, "backup", "Backup Now", true, None::<&str>)?;
+    let autostart_label = {
+        // Will be set at runtime; initial label before state loads
+        "Enable Launch at Login"
+    };
+    let autostart =
+        MenuItem::with_id(app, "autostart", autostart_label, true, None::<&str>)?;
+    let sep = PredefinedMenuItem::separator(app)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+
+    let menu = Menu::with_items(app, &[&open, &backup, &autostart, &sep, &quit])?;
+
+    let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray-icon.png"))?;
+
+    TrayIconBuilder::with_id("zen-sync-tray")
+        .icon(tray_icon)
+        .icon_as_template(true)
+        .menu(&menu)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "open" => {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
+            "backup" => {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = app.state::<Arc<Mutex<AppState>>>();
+                    let result = tray_backup(&app, state).await;
+                    if let Err(e) = result {
+                        crate::zslog!("[tray] backup failed: {e}");
+                    }
+                });
+            }
+            "autostart" => {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    toggle_autostart_tray(&app).await;
+                });
+            }
+            "check_updates" => {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    check_for_updates(&app, true).await;
+                });
+            }
+            "install_update" => {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                    }
+                    let store = app.state::<Arc<UpdateStore>>();
+                    let version =
+                        store.version.lock().unwrap().clone().unwrap_or_default();
+                    let notes =
+                        store.notes.lock().unwrap().clone().unwrap_or_default();
+                    let _ = app.emit(
+                        "update-available",
+                        serde_json::json!({ "version": version, "notes": notes }),
+                    );
+                });
+            }
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                let app = tray.app_handle();
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
+        })
+        .build(app)?;
+
+    Ok(menu)
+}
+
+async fn tray_backup(
+    app: &tauri::AppHandle,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    if zen_check::is_zen_running() {
+        return Err("Zen Browser is running — close it before backing up".into());
+    }
+    let (client, machine_name, machine_id, max_snapshots, selected_ext_ids, config_dir) = {
+        let s = state.lock().unwrap();
+        let c = s
+            .github_client
+            .clone()
+            .ok_or("Not connected to GitHub")?;
+        (
+            c,
+            s.local_state.machine_name.clone(),
+            s.machine_id(),
+            s.local_state.snapshot_count,
+            s.local_state.selected_extension_ids.clone(),
+            s.config_dir.clone(),
+        )
+    };
+
+    let app_p = app.clone();
+    let pushed_at = sync::backup(
+        &client,
+        &machine_name,
+        &machine_id,
+        max_snapshots,
+        &selected_ext_ids,
+        move |msg| {
+            let _ = app_p.emit("sync-progress", msg);
+        },
+    )
+    .await?;
+
+    {
+        let mut s = state.lock().unwrap();
+        s.local_state.last_backup_at = Some(pushed_at);
+        let _ = s.local_state.save(&config_dir);
+    }
+    let _ = app.emit("sync-updated", ());
+    Ok(())
+}
+
+async fn toggle_autostart_tray(app: &tauri::AppHandle) {
+    use tauri_plugin_autostart::ManagerExt;
+    let autolaunch = app.autolaunch();
+    let current = autolaunch.is_enabled().unwrap_or(false);
+    if current {
+        let _ = autolaunch.disable();
+        crate::zslog!("[autostart] disabled");
+    } else {
+        let _ = autolaunch.enable();
+        crate::zslog!("[autostart] enabled");
+    }
+    // Update tray item label
+    if let Some(tray) = app.tray_by_id("zen-sync-tray") {
+        if let Some(menu) = tray.menu() {
+            if let Some(item) = menu.get("autostart") {
+                use tauri::menu::MenuItemKind;
+                if let MenuItemKind::MenuItem(mi) = item {
+                    let label = if !current {
+                        "Disable Launch at Login"
+                    } else {
+                        "Enable Launch at Login"
+                    };
+                    let _ = mi.set_text(label);
+                }
+            }
+        }
+    }
+    let _ = app.emit("autostart-changed", !current);
+}
+
+// ── Update handling ───────────────────────────────────────────────────────────
+
+async fn check_for_updates(app: &tauri::AppHandle, manual: bool) {
+    use tauri_plugin_notification::NotificationExt;
+
+    let updater = match app.updater() {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("[updater] init error: {e}");
+            return;
+        }
+    };
+
+    let update = match updater.check().await {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            if manual {
+                let _ = app
+                    .notification()
+                    .builder()
+                    .title("Zen Sync is up to date")
+                    .body("You're running the latest version.")
+                    .show();
+            }
+            return;
+        }
+        Err(e) => {
+            eprintln!("[updater] check error: {e}");
+            return;
+        }
+    };
+
+    let version = update.version.clone();
+    let notes = update.body.clone().unwrap_or_default();
+
+    let store = app.state::<Arc<UpdateStore>>();
+    *store.update.lock().await = Some(update);
+    *store.version.lock().unwrap() = Some(version.clone());
+    *store.notes.lock().unwrap() = Some(notes.clone());
+
+    if manual {
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.show();
+            let _ = w.set_focus();
+        }
+    }
+
+    let _ = app.emit(
+        "update-available",
+        serde_json::json!({ "version": version, "notes": notes }),
+    );
+
+    rebuild_tray_with_update(app, &version);
+}
+
+fn rebuild_tray_with_update(app: &tauri::AppHandle, version: &str) {
+    let Ok(install) = MenuItem::with_id(
+        app,
+        "install_update",
+        format!("Install update ({})", version),
+        true,
+        None::<&str>,
+    ) else {
+        return;
+    };
+    let Ok(sep1) = PredefinedMenuItem::separator(app) else {
+        return;
+    };
+
+    let base_menu = app.state::<Arc<TrayMenuState>>();
+    let Some(open) = base_menu.menu.get("open") else {
+        return;
+    };
+    let Some(backup) = base_menu.menu.get("backup") else {
+        return;
+    };
+    let Some(autostart) = base_menu.menu.get("autostart") else {
+        return;
+    };
+    let Ok(sep2) = PredefinedMenuItem::separator(app) else {
+        return;
+    };
+    let Some(quit) = base_menu.menu.get("quit") else {
+        return;
+    };
+
+    let Ok(menu) = Menu::with_items(
+        app,
+        &[
+            &install as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
+            &sep1,
+            &open as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
+            &backup as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
+            &autostart as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
+            &sep2,
+            &quit as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
+        ],
+    ) else {
+        return;
+    };
+
+    if let Some(tray) = app.tray_by_id("zen-sync-tray") {
+        let _ = tray.set_menu(Some(menu));
+    }
+}
+
+// ── Tauri commands ────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AppStatusPayload {
+    connected: bool,
+    username: Option<String>,
+    machine_name: String,
+    last_backup_at: Option<String>,
+    snapshot_count: u8,
+    autostart_enabled: bool,
+}
+
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotInfoPayload {
+    pub index: u8,
+    pub pushed_at: String,
+    pub machine_name: String,
+    pub size_mb: f32,
+    pub is_current: bool,
+    pub machine_id: String,
+}
+
+#[tauri::command]
+fn get_status_cmd(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> AppStatusPayload {
+    use tauri_plugin_autostart::ManagerExt;
+    let s = state.lock().unwrap();
+    let autostart_enabled = app.autolaunch().is_enabled().unwrap_or(false);
+    AppStatusPayload {
+        connected: s.github_client.is_some(),
+        username: s
+            .github_client
+            .as_ref()
+            .map(|c| c.username.clone()),
+        machine_name: s.local_state.machine_name.clone(),
+        last_backup_at: s.local_state.last_backup_at.clone(),
+        snapshot_count: s.local_state.snapshot_count,
+        autostart_enabled,
+    }
+}
+
+#[tauri::command]
+async fn connect_github_cmd(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<AppStatusPayload, String> {
+    let client = github::GitHubClient::connect(&app).await?;
+    {
+        let mut s = state.lock().unwrap();
+        s.github_client = Some(Arc::new(client));
+    }
+    Ok(get_status_cmd(app, state))
+}
+
+#[tauri::command]
+fn disconnect_github_cmd(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    github::remove_stored_token()?;
+    state.lock().unwrap().github_client = None;
+    Ok(())
+}
+
+#[tauri::command]
+async fn backup_now_cmd(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    if zen_check::is_zen_running() {
+        return Err(
+            "Zen Browser is open. Close it completely before backing up.".into(),
+        );
+    }
+
+    let (client, machine_name, machine_id, max_snapshots, selected_ext_ids, config_dir) = {
+        let s = state.lock().unwrap();
+        let c = s.github_client.clone().ok_or("Not connected to GitHub")?;
+        (
+            c,
+            s.local_state.machine_name.clone(),
+            s.machine_id(),
+            s.local_state.snapshot_count,
+            s.local_state.selected_extension_ids.clone(),
+            s.config_dir.clone(),
+        )
+    };
+
+    let app_p = app.clone();
+    let pushed_at = sync::backup(
+        &client,
+        &machine_name,
+        &machine_id,
+        max_snapshots,
+        &selected_ext_ids,
+        move |msg| {
+            let _ = app_p.emit("sync-progress", msg);
+        },
+    )
+    .await?;
+
+    {
+        let mut s = state.lock().unwrap();
+        s.local_state.last_backup_at = Some(pushed_at);
+        let _ = s.local_state.save(&config_dir);
+    }
+    let _ = app.emit("sync-updated", ());
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_snapshots_cmd(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<SnapshotInfoPayload>, String> {
+    let client = {
+        let s = state.lock().unwrap();
+        s.github_client.clone().ok_or("Not connected to GitHub")?
+    };
+
+    let metadata = client
+        .read_metadata()
+        .await?
+        .ok_or("No backup data found yet. Back up from any device first.")?;
+
+    // Collect all snapshots from all machines, newest first across machines.
+    let mut infos: Vec<SnapshotInfoPayload> = metadata
+        .metadata
+        .machines
+        .iter()
+        .flat_map(|m| {
+            let current = m.current_index;
+            m.snapshots.iter().map(move |s| SnapshotInfoPayload {
+                index: s.index,
+                pushed_at: s.pushed_at.clone(),
+                machine_name: s.machine_name.clone(),
+                size_mb: s.size_bytes as f32 / 1_048_576.0,
+                is_current: s.index == current,
+                machine_id: m.machine_id.clone(),
+            })
+        })
+        .collect();
+
+    // Sort newest-first by pushed_at
+    infos.sort_by(|a, b| b.pushed_at.cmp(&a.pushed_at));
+    Ok(infos)
+}
+
+#[tauri::command]
+async fn restore_snapshot_cmd(
+    index: u8,
+    machine_id: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    if zen_check::is_zen_running() {
+        return Err(
+            "Zen Browser is open. Close it completely before restoring.".into(),
+        );
+    }
+
+    let (client, selected_ext_ids) = {
+        let s = state.lock().unwrap();
+        let c = s.github_client.clone().ok_or("Not connected to GitHub")?;
+        (c, s.local_state.selected_extension_ids.clone())
+    };
+
+    let app_p = app.clone();
+    sync::restore(&client, &machine_id, index, &selected_ext_ids, move |msg| {
+        let _ = app_p.emit("sync-progress", msg);
+    })
+    .await?;
+
+    let _ = app.emit("sync-updated", ());
+    Ok(())
+}
+
+#[tauri::command]
+fn set_machine_name_cmd(
+    name: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let mut s = state.lock().unwrap();
+    s.local_state.machine_name = name;
+    let config_dir = s.config_dir.clone();
+    s.local_state.save(&config_dir)
+}
+
+#[tauri::command]
+fn set_snapshot_count_cmd(
+    count: u8,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let mut s = state.lock().unwrap();
+    s.local_state.snapshot_count = count.clamp(1, 10);
+    let config_dir = s.config_dir.clone();
+    s.local_state.save(&config_dir)
+}
+
+
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionInfoWithSelection {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub enabled: bool,
+    pub icon_url: Option<String>,
+    pub synced: bool,
+}
+
+#[tauri::command]
+fn get_extensions_with_selection_cmd(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<ExtensionInfoWithSelection>, String> {
+    let profile_dir = profile::find_zen_profile()
+        .ok_or("Zen profile folder not found. Is Zen Browser installed?")?;
+    let list = extensions::list_extensions(&profile_dir)?;
+    let selected = state.lock().unwrap().local_state.selected_extension_ids.clone();
+    let sync_all = selected.is_empty();
+    let set: std::collections::HashSet<&str> =
+        selected.iter().map(|s| s.as_str()).collect();
+    let result = list
+        .into_iter()
+        .map(|e| {
+            let synced = sync_all || set.contains(e.id.as_str());
+            ExtensionInfoWithSelection {
+                synced,
+                id: e.id,
+                name: e.name,
+                version: e.version,
+                enabled: e.enabled,
+                icon_url: e.icon_url,
+            }
+        })
+        .collect();
+    Ok(result)
+}
+
+#[tauri::command]
+fn set_extension_selection_cmd(
+    ids: Vec<String>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let mut s = state.lock().unwrap();
+    s.local_state.selected_extension_ids = ids;
+    let config_dir = s.config_dir.clone();
+    s.local_state.save(&config_dir)
+}
+
+#[tauri::command]
+async fn set_autostart_cmd(
+    enabled: bool,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    if enabled {
+        app.autolaunch()
+            .enable()
+            .map_err(|e| format!("Failed to enable autostart: {e}"))?;
+    } else {
+        app.autolaunch()
+            .disable()
+            .map_err(|e| format!("Failed to disable autostart: {e}"))?;
+    }
+    crate::zslog!("[autostart] set to {enabled}");
+    Ok(())
+}
+
+#[tauri::command]
+async fn open_log_cmd(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let path = match logger::path() {
+        Some(p) => p.to_path_buf(),
+        None => return Err("Logging is not initialised".into()),
+    };
+    if !path.exists() {
+        return Err("No log file found yet".into());
+    }
+    app.opener()
+        .open_path(path.to_string_lossy(), None::<&str>)
+        .map_err(|e| format!("Cannot open log file: {e}"))
+}
+
+#[tauri::command]
+async fn install_update(
+    app: tauri::AppHandle,
+    store: tauri::State<'_, Arc<UpdateStore>>,
+) -> Result<(), String> {
+    let update = store
+        .update
+        .lock()
+        .await
+        .take()
+        .ok_or("No pending update")?;
+    update
+        .download_and_install(|_chunk, _total| {}, || {})
+        .await
+        .map_err(|e| e.to_string())?;
+    app.restart();
+}

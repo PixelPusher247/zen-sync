@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.env
+.env.local
+
+# Tauri build output
+src-tauri/target/
+src-tauri/gen/
+
+# Editor
+.vscode/settings.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
