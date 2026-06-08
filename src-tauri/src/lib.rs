@@ -9,11 +9,7 @@ mod sync;
 mod zen_check;
 
 use std::sync::{Arc, Mutex};
-use tauri::{
-    menu::{Menu, MenuItem, PredefinedMenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Emitter, Manager,
-};
+use tauri::{Emitter, Manager};
 use tauri_plugin_updater::UpdaterExt;
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -36,10 +32,6 @@ impl AppState {
             .trim_matches('-')
             .to_string()
     }
-}
-
-struct TrayMenuState {
-    menu: Menu<tauri::Wry>,
 }
 
 struct UpdateStore {
@@ -100,19 +92,8 @@ pub fn run() {
                 }
             }
 
-            let tray_menu = setup_tray(app)?;
-            app.manage(Arc::new(TrayMenuState { menu: tray_menu }));
-
-            // Close button hides to tray instead of quitting
             let window = app.get_webview_window("main")
                 .ok_or("main window not found")?;
-            let win = window.clone();
-            window.on_window_event(move |event| {
-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    let _ = win.hide();
-                }
-            });
 
             // Show window on first run (no GitHub token yet)
             if !github::has_stored_token() {
@@ -179,130 +160,6 @@ pub fn run() {
         .expect("error while running zen-sync");
 }
 
-// ── Tray ──────────────────────────────────────────────────────────────────────
-
-fn setup_tray(app: &mut tauri::App) -> Result<Menu<tauri::Wry>, Box<dyn std::error::Error>> {
-    let open = MenuItem::with_id(app, "open", "Open Zen Sync", true, None::<&str>)?;
-    let backup = MenuItem::with_id(app, "backup", "Backup Now", true, None::<&str>)?;
-    let sep = PredefinedMenuItem::separator(app)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-
-    let menu = Menu::with_items(app, &[&open, &backup, &sep, &quit])?;
-
-    let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray-icon.png"))?;
-
-    TrayIconBuilder::with_id("zen-sync-tray")
-        .icon(tray_icon)
-        .icon_as_template(true)
-        .menu(&menu)
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "open" => {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
-            }
-            "backup" => {
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = app.state::<Arc<Mutex<AppState>>>();
-                    let result = tray_backup(&app, state).await;
-                    if let Err(e) = result {
-                        crate::zslog!("[tray] backup failed: {e}");
-                    }
-                });
-            }
-            "check_updates" => {
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    check_for_updates(&app, true).await;
-                });
-            }
-            "install_update" => {
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Some(w) = app.get_webview_window("main") {
-                        let _ = w.show();
-                        let _ = w.set_focus();
-                    }
-                    let store = app.state::<Arc<UpdateStore>>();
-                    let version =
-                        store.version.lock().unwrap().clone().unwrap_or_default();
-                    let notes =
-                        store.notes.lock().unwrap().clone().unwrap_or_default();
-                    let _ = app.emit(
-                        "update-available",
-                        serde_json::json!({ "version": version, "notes": notes }),
-                    );
-                });
-            }
-            "quit" => app.exit(0),
-            _ => {}
-        })
-        .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                let app = tray.app_handle();
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
-            }
-        })
-        .build(app)?;
-
-    Ok(menu)
-}
-
-async fn tray_backup(
-    app: &tauri::AppHandle,
-    state: tauri::State<'_, Arc<Mutex<AppState>>>,
-) -> Result<(), String> {
-    if zen_check::is_zen_running() {
-        return Err("Zen Browser is running — close it before backing up".into());
-    }
-    let (client, machine_name, machine_id, max_snapshots, selected_ext_ids, config_dir) = {
-        let s = state.lock().unwrap();
-        let c = s
-            .github_client
-            .clone()
-            .ok_or("Not connected to GitHub")?;
-        (
-            c,
-            s.local_state.machine_name.clone(),
-            s.machine_id(),
-            s.local_state.snapshot_count,
-            s.local_state.selected_extension_ids.clone(),
-            s.config_dir.clone(),
-        )
-    };
-
-    let app_p = app.clone();
-    let pushed_at = sync::backup(
-        &client,
-        &machine_name,
-        &machine_id,
-        max_snapshots,
-        &selected_ext_ids,
-        move |msg| {
-            let _ = app_p.emit("sync-progress", msg);
-        },
-    )
-    .await?;
-
-    {
-        let mut s = state.lock().unwrap();
-        s.local_state.last_backup_at = Some(pushed_at);
-        let _ = s.local_state.save(&config_dir);
-    }
-    let _ = app.emit("sync-updated", ());
-    Ok(())
-}
-
 // ── Update handling ───────────────────────────────────────────────────────────
 
 async fn check_for_updates(app: &tauri::AppHandle, manual: bool) {
@@ -354,55 +211,6 @@ async fn check_for_updates(app: &tauri::AppHandle, manual: bool) {
         "update-available",
         serde_json::json!({ "version": version, "notes": notes }),
     );
-
-    rebuild_tray_with_update(app, &version);
-}
-
-fn rebuild_tray_with_update(app: &tauri::AppHandle, version: &str) {
-    let Ok(install) = MenuItem::with_id(
-        app,
-        "install_update",
-        format!("Install update ({})", version),
-        true,
-        None::<&str>,
-    ) else {
-        return;
-    };
-    let Ok(sep1) = PredefinedMenuItem::separator(app) else {
-        return;
-    };
-
-    let base_menu = app.state::<Arc<TrayMenuState>>();
-    let Some(open) = base_menu.menu.get("open") else {
-        return;
-    };
-    let Some(backup) = base_menu.menu.get("backup") else {
-        return;
-    };
-    let Ok(sep2) = PredefinedMenuItem::separator(app) else {
-        return;
-    };
-    let Some(quit) = base_menu.menu.get("quit") else {
-        return;
-    };
-
-    let Ok(menu) = Menu::with_items(
-        app,
-        &[
-            &install as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
-            &sep1,
-            &open as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
-            &backup as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
-            &sep2,
-            &quit as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
-        ],
-    ) else {
-        return;
-    };
-
-    if let Some(tray) = app.tray_by_id("zen-sync-tray") {
-        let _ = tray.set_menu(Some(menu));
-    }
 }
 
 // ── Tauri commands ────────────────────────────────────────────────────────────

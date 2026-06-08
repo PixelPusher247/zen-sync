@@ -6,7 +6,7 @@
 
 **Encrypted Zen Browser profile backups, on demand.**
 
-[![Version](https://img.shields.io/badge/version-0.1.0-7c6af7?style=flat-square)](https://github.com/PixelPusher247/zen-sync/releases/latest)
+[![Version](https://img.shields.io/github/v/release/PixelPusher247/zen-sync?style=flat-square&color=7c6af7&label=version)](https://github.com/PixelPusher247/zen-sync/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078d4?style=flat-square)](#installation)
 [![License](https://img.shields.io/badge/license-MIT-7c6af7?style=flat-square)](LICENSE)
 
@@ -128,6 +128,12 @@ npm run build    # production installer → src-tauri/target/release/bundle/
 | Device name on restore | Overwritten | Preserved |
 | Extension selection | All or nothing | Per-extension toggle |
 | Autostart | Enabled by default | Disabled by default |
+
+---
+
+## Acknowledgements
+
+Zen Sync was inspired by [Zync](https://github.com/jessewallace/zync) by Jesse Wallace — a full-featured Zen Browser sync tool with automatic triggers and cross-platform support. Zen Sync was built in search of a simpler, manual push/pull alternative without background daemons or auto-sync.
 
 ---
 

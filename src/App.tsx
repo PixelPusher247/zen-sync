@@ -20,7 +20,11 @@ export default function App() {
     try {
       const s = await bridge.getStatus();
       setStatus(s);
-      if (!s.connected) setScreen("setup");
+      if (!s.connected) {
+        setScreen("setup");
+      } else {
+        setScreen((prev) => (prev === "setup" ? "dashboard" : prev));
+      }
     } catch (e) {
       console.error("getStatus failed:", e);
     }
