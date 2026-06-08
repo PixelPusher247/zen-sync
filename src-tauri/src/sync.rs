@@ -62,6 +62,14 @@ fn collect_files(
         crate::zslog!("[sync] collected {name} ({} bytes)", bytes.len());
         files.insert(name.to_string(), BASE64.encode(&bytes));
     }
+    // Walk chrome/zen-themes/ for per-mod chrome.css and preferences.json
+    for (key, abs_path) in profile::zen_themes_files(profile_dir) {
+        let bytes = std::fs::read(&abs_path)
+            .map_err(|e| format!("Could not read {key}: {e}"))?;
+        crate::zslog!("[sync] collected {key} ({} bytes)", bytes.len());
+        files.insert(key, BASE64.encode(&bytes));
+    }
+
     if files.is_empty() {
         return Err("No sync files found in the Zen profile folder".into());
     }

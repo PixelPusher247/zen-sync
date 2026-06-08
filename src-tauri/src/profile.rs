@@ -8,9 +8,35 @@ pub const SYNC_FILES: &[&str] = &[
     "zen-keyboard-shortcuts.json",
     "zen-sessions.jsonlz4",
     "zen-live-folders.jsonlz4",
+    "chrome/userChrome.css",
     "chrome/zen-themes.css",
     "containers.json",
 ];
+
+/// Enumerate every file under `chrome/zen-themes/` (per-mod CSS + preferences.json)
+/// and return `(bundle_key, absolute_path)` pairs where the bundle key uses forward
+/// slashes relative to the profile root.
+pub fn zen_themes_files(profile_dir: &Path) -> Vec<(String, PathBuf)> {
+    let themes_dir = profile_dir.join("chrome").join("zen-themes");
+    let mut out = Vec::new();
+    collect_dir_recursive(&themes_dir, profile_dir, &mut out);
+    out
+}
+
+fn collect_dir_recursive(dir: &Path, profile_root: &Path, out: &mut Vec<(String, PathBuf)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_dir_recursive(&path, profile_root, out);
+        } else if path.is_file() {
+            if let Ok(rel) = path.strip_prefix(profile_root) {
+                let key = rel.to_string_lossy().replace('\\', "/");
+                out.push((key, path));
+            }
+        }
+    }
+}
 
 #[tauri::command]
 pub fn detect_profile_path() -> Result<String, String> {
