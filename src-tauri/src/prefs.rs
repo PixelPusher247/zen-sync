@@ -1,117 +1,169 @@
-/// Per-machine prefs.js key prefixes that must never leave the device.
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Prefs a restore must never write, even if a mod declares them as a setting.
 ///
-/// These are device-identity or sync-account keys.  Sending them cross-machine
-/// overwrites the target device's Firefox Sync account binding and device name,
-/// which was the root cause of the bug in zync.
-const EXCLUDED_PREFIXES: &[&str] = &[
-    // Firefox / Zen Sync account + device identity
+/// Device identity and sync-account keys caused the device-name bug in zync;
+/// the remaining entries are Sine or extension bookkeeping that is specific to
+/// the local install.
+const PROTECTED_PREFIXES: &[&str] = &[
     "services.sync.",
-    "identity.fxaccounts.",
-    "identity.sync.",
-    // Per-device update state
+    "identity.",
     "app.update.",
-    "zen.updates.",
-    // Telemetry IDs — machine-specific
-    "toolkit.telemetry.cachedClientID",
-    "toolkit.telemetry.previousBuildID",
-    "toolkit.telemetry.hybridContent.enabled",
-    // New-tab impression IDs
-    "browser.newtabpage.activity-stream.impressionId",
-    "browser.newtabpage.activity-stream.telemetry.session.transitionedToPrivacyNotice",
-    // Session-restore can contain open tabs — skip (too large, machine-specific)
-    "browser.sessionstore.",
-    // Build-specific migration markers
-    "browser.startup.homepage_override.mstone",
-    "browser.startup.homepage_override.buildID",
+    "extensions.webextensions.",
+    "sine.engine.pending-restart",
+    "sine.is-cosine",
+    "sine.fork-id",
 ];
 
-/// Returns true if the given user_pref line should be excluded from the backup.
-fn is_excluded_line(line: &str) -> bool {
-    let t = line.trim_start();
-    if !t.starts_with("user_pref(\"") {
-        return false;
-    }
-    // Extract key name between the first pair of quotes
-    let after_open = &t["user_pref(\"".len()..];
-    let key_end = match after_open.find('"') {
-        Some(i) => i,
-        None => return false,
-    };
-    let key = &after_open[..key_end];
-    EXCLUDED_PREFIXES.iter().any(|prefix| key.starts_with(prefix))
+pub fn is_protected(name: &str) -> bool {
+    PROTECTED_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
 }
 
-/// Strip all per-machine keys from prefs.js content before uploading.
-pub fn strip_machine_prefs(content: &str) -> String {
+/// Split a `user_pref("name", value);` line into its name and raw value literal.
+fn parse_line(line: &str) -> Option<(&str, &str)> {
+    let rest = line.trim().strip_prefix("user_pref(\"")?;
+    let key_end = rest.find('"')?;
+    let key = &rest[..key_end];
+    let value = rest[key_end + 1..].trim_start().strip_prefix(',')?;
+    let value = value.trim_end().strip_suffix(';')?.trim_end().strip_suffix(')')?;
+    Some((key, value.trim()))
+}
+
+fn format_line(name: &str, raw_value: &str) -> String {
+    format!("user_pref(\"{name}\", {raw_value});")
+}
+
+/// Raw value literal of a single pref, if set. The last occurrence wins, as in Firefox.
+pub fn get_raw<'a>(content: &'a str, name: &str) -> Option<&'a str> {
     content
         .lines()
-        .filter(|line| !is_excluded_line(line))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .rev()
+        .filter_map(parse_line)
+        .find(|(key, _)| *key == name)
+        .map(|(_, value)| value)
 }
 
-/// After writing a restored prefs.js, re-inject the lines from the local
-/// (pre-restore) prefs.js that match the excluded prefixes so the local
-/// device identity is preserved.
-pub fn restore_machine_prefs(restored_content: &str, local_content: &str) -> String {
-    let local_machine_lines: Vec<&str> = local_content
+/// Raw value literals for every pref in `names` that is set in `content`.
+pub fn read_values(content: &str, names: &BTreeSet<String>) -> BTreeMap<String, String> {
+    content
         .lines()
-        .filter(|line| is_excluded_line(line))
-        .collect();
+        .filter_map(parse_line)
+        .filter(|(key, _)| names.contains(*key))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
 
-    let mut result = restored_content
-        .lines()
-        .filter(|line| !is_excluded_line(line))
-        .collect::<Vec<_>>();
-
-    if !local_machine_lines.is_empty() {
-        result.push("");
-        result.push("// Restored by zen-sync — per-device settings preserved");
-        result.extend_from_slice(&local_machine_lines);
+/// Set prefs to the given raw literals and delete the lines of prefs in `clear`
+/// (resetting them to their defaults). Every other line is kept untouched.
+pub fn apply(content: &str, set: &BTreeMap<String, String>, clear: &BTreeSet<String>) -> String {
+    let newline = if content.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut written = BTreeSet::new();
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        if let Some((key, _)) = parse_line(line) {
+            if let Some(value) = set.get(key) {
+                if written.insert(key) {
+                    lines.push(format_line(key, value));
+                }
+                continue;
+            }
+            if clear.contains(key) {
+                continue;
+            }
+        }
+        lines.push(line.to_string());
     }
-    result.join("\n")
+    for (key, value) in set {
+        if !written.contains(key.as_str()) {
+            lines.push(format_line(key, value));
+        }
+    }
+    let mut out = lines.join(newline);
+    out.push_str(newline);
+    out
+}
+
+/// Encode a string as a prefs.js string literal.
+pub fn string_literal(value: &str) -> String {
+    // prefs.js string escapes (\" \\ \n \r \uXXXX) are a subset of JSON's.
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into())
+}
+
+/// Decode a prefs.js string literal.
+pub fn parse_string_literal(raw: &str) -> Option<String> {
+    serde_json::from_str(raw).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn strips_sync_keys() {
-        let prefs = r#"user_pref("browser.tabs.warnOnClose", true);
-user_pref("services.sync.client.name", "My Old PC");
-user_pref("identity.fxaccounts.account.device.name", "Old Device");
-user_pref("zen.workspaces.show-icon-only", false);
-user_pref("app.update.channel", "release");"#;
-
-        let stripped = strip_machine_prefs(prefs);
-        assert!(!stripped.contains("services.sync."));
-        assert!(!stripped.contains("identity.fxaccounts."));
-        assert!(!stripped.contains("app.update."));
-        assert!(stripped.contains("browser.tabs.warnOnClose"));
-        assert!(stripped.contains("zen.workspaces.show-icon-only"));
-    }
-
-    #[test]
-    fn restores_local_machine_prefs() {
-        let restored = r#"user_pref("browser.tabs.warnOnClose", true);"#;
-        let local = r#"user_pref("browser.tabs.warnOnClose", false);
+    const PREFS: &str = r#"// Mozilla User Preferences
+user_pref("mod.lean.hide-zoom", true);
+user_pref("uc.essentials.width", "Thin");
 user_pref("services.sync.client.name", "This PC");
-user_pref("identity.fxaccounts.account.device.name", "This Device");"#;
+user_pref("zen.mods.AudioIndicatorEnhanced.audioWave.opacity", "0.2");
+"#;
 
-        let merged = restore_machine_prefs(restored, local);
-        // Local machine keys re-injected
-        assert!(merged.contains(r#"services.sync.client.name", "This PC"#));
-        assert!(merged.contains(r#"identity.fxaccounts.account.device.name", "This Device"#));
-        // Restored content preserved
-        assert!(merged.contains("browser.tabs.warnOnClose"));
+    fn names(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
-    fn non_pref_lines_pass_through() {
-        let prefs = "// comment\n\nuser_pref(\"dom.webcomponents.enabled\", true);";
-        let stripped = strip_machine_prefs(prefs);
-        assert!(stripped.contains("// comment"));
-        assert!(stripped.contains("dom.webcomponents.enabled"));
+    fn reads_declared_values_as_raw_literals() {
+        let values = read_values(PREFS, &names(&["mod.lean.hide-zoom", "uc.essentials.width", "missing"]));
+        assert_eq!(values.len(), 2);
+        assert_eq!(values["mod.lean.hide-zoom"], "true");
+        assert_eq!(values["uc.essentials.width"], "\"Thin\"");
+    }
+
+    #[test]
+    fn apply_sets_clears_and_appends() {
+        let mut set = BTreeMap::new();
+        set.insert("uc.essentials.width".to_string(), "\"Normal\"".to_string());
+        set.insert("better_findbar.textbox_width".to_string(), "300".to_string());
+        let out = apply(PREFS, &set, &names(&["mod.lean.hide-zoom"]));
+
+        assert!(out.starts_with("// Mozilla User Preferences\n"));
+        assert!(!out.contains("mod.lean.hide-zoom"));
+        assert!(out.contains(r#"user_pref("uc.essentials.width", "Normal");"#));
+        assert!(!out.contains("Thin"));
+        assert!(out.contains(r#"user_pref("better_findbar.textbox_width", 300);"#));
+        // Untouched lines survive, including device identity.
+        assert!(out.contains(r#"user_pref("services.sync.client.name", "This PC");"#));
+        assert!(out.contains("zen.mods.AudioIndicatorEnhanced.audioWave.opacity"));
+    }
+
+    #[test]
+    fn apply_preserves_crlf() {
+        let content = "user_pref(\"a.b\", 1);\r\nuser_pref(\"c.d\", 2);\r\n";
+        let mut set = BTreeMap::new();
+        set.insert("a.b".to_string(), "5".to_string());
+        let out = apply(content, &set, &BTreeSet::new());
+        assert_eq!(out, "user_pref(\"a.b\", 5);\r\nuser_pref(\"c.d\", 2);\r\n");
+    }
+
+    #[test]
+    fn values_containing_parens_and_escapes_round_trip() {
+        let line = r#"user_pref("zen.mods.x.color", "color-mix(in srgb, -moz-dialogtext 50%, rgb(129, 0, 0) 50%)");"#;
+        assert_eq!(
+            get_raw(line, "zen.mods.x.color"),
+            Some(r#""color-mix(in srgb, -moz-dialogtext 50%, rgb(129, 0, 0) 50%)""#)
+        );
+
+        let json = r#"{"a@b":"1234"}"#;
+        let literal = string_literal(json);
+        assert_eq!(literal, r#""{\"a@b\":\"1234\"}""#);
+        assert_eq!(parse_string_literal(&literal).as_deref(), Some(json));
+    }
+
+    #[test]
+    fn protects_identity_and_bookkeeping_prefs() {
+        assert!(is_protected("services.sync.client.name"));
+        assert!(is_protected("identity.fxaccounts.account.device.name"));
+        assert!(is_protected("extensions.webextensions.uuids"));
+        assert!(is_protected("sine.engine.pending-restart"));
+        assert!(!is_protected("sine.allow-unsafe-js"));
+        assert!(!is_protected("mod.lean.hide-zoom"));
     }
 }

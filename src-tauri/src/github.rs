@@ -12,7 +12,11 @@ const GITHUB_CLIENT_SECRET: &str = env!("GITHUB_CLIENT_SECRET");
 pub const REPO_NAME: &str = "zen-sync-backup";
 const RELEASE_TAG: &str = "storage";
 const ENCRYPTION_KEY_ASSET: &str = "encryption-key.b64";
-const METADATA_PATH: &str = "metadata.json";
+const METADATA_PATH: &str = "metadata-v2.json";
+const SNAPSHOT_ASSET_PREFIX: &str = "mods-";
+/// Full-profile snapshots written by zen-sync ≤ 0.1.x.
+const LEGACY_METADATA_PATH: &str = "metadata.json";
+const LEGACY_ASSET_PREFIX: &str = "profile-";
 const API_BASE: &str = "https://api.github.com";
 const UPLOAD_BASE: &str = "https://uploads.github.com";
 
@@ -54,6 +58,35 @@ pub struct SyncMetadata {
 pub struct MetadataWithSha {
     pub metadata: SyncMetadata,
     pub sha: String,
+}
+
+/// Leftovers from zen-sync ≤ 0.1.x, deleted on the first backup in the new format.
+#[derive(Default)]
+pub struct LegacySnapshots {
+    pub asset_ids: Vec<u64>,
+    metadata_sha: Option<String>,
+}
+
+impl LegacySnapshots {
+    pub fn is_empty(&self) -> bool {
+        self.asset_ids.is_empty() && self.metadata_sha.is_none()
+    }
+}
+
+#[derive(Deserialize)]
+struct Asset {
+    id: u64,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct ContentsResp {
+    content: String,
+    sha: String,
+}
+
+fn snapshot_asset_name(machine_id: &str, index: u8) -> String {
+    format!("{SNAPSHOT_ASSET_PREFIX}{machine_id}-{index}.enc")
 }
 
 #[derive(Serialize, Deserialize)]
@@ -487,17 +520,11 @@ impl GitHubClient {
 
     // ── Metadata ──────────────────────────────────────────────────────────────
 
-    pub async fn read_metadata(&self) -> Result<Option<MetadataWithSha>, String> {
-        #[derive(Deserialize)]
-        struct ContentsResp {
-            content: String,
-            sha: String,
-        }
-
+    async fn get_contents(&self, path: &str) -> Result<Option<ContentsResp>, String> {
         let resp = self
             .http
             .get(format!(
-                "{API_BASE}/repos/{}/{REPO_NAME}/contents/{METADATA_PATH}",
+                "{API_BASE}/repos/{}/{REPO_NAME}/contents/{path}",
                 self.username
             ))
             .headers(self.api_headers())
@@ -515,6 +542,13 @@ impl GitHubClient {
             .json()
             .await
             .map_err(|e| format!("Metadata parse error: {e}"))?;
+        Ok(Some(c))
+    }
+
+    pub async fn read_metadata(&self) -> Result<Option<MetadataWithSha>, String> {
+        let Some(c) = self.get_contents(METADATA_PATH).await? else {
+            return Ok(None);
+        };
 
         let decoded = BASE64
             .decode(c.content.replace('\n', ""))
@@ -559,32 +593,85 @@ impl GitHubClient {
         Ok(())
     }
 
+    // ── Legacy snapshots ──────────────────────────────────────────────────────
+
+    pub async fn find_legacy_snapshots(&self) -> Result<LegacySnapshots, String> {
+        let metadata_sha = self.get_contents(LEGACY_METADATA_PATH).await?.map(|c| c.sha);
+        let asset_ids = self
+            .list_assets()
+            .await?
+            .into_iter()
+            .filter(|a| a.name.starts_with(LEGACY_ASSET_PREFIX) && a.name.ends_with(".enc"))
+            .map(|a| a.id)
+            .collect();
+        Ok(LegacySnapshots { asset_ids, metadata_sha })
+    }
+
+    pub async fn delete_legacy_snapshots(&self, legacy: &LegacySnapshots) -> Result<(), String> {
+        for &id in &legacy.asset_ids {
+            self.delete_asset(id).await?;
+        }
+        if let Some(sha) = &legacy.metadata_sha {
+            self.http
+                .delete(format!(
+                    "{API_BASE}/repos/{}/{REPO_NAME}/contents/{LEGACY_METADATA_PATH}",
+                    self.username
+                ))
+                .headers(self.api_headers())
+                .json(&serde_json::json!({
+                    "message": "zen-sync: remove legacy full-profile snapshots",
+                    "sha": sha,
+                }))
+                .send()
+                .await
+                .map_err(|e| format!("Legacy metadata delete failed: {e}"))?
+                .error_for_status()
+                .map_err(|e| format!("Legacy metadata delete error: {e}"))?;
+        }
+        crate::zslog!(
+            "[github] deleted {} legacy snapshot assets",
+            legacy.asset_ids.len()
+        );
+        Ok(())
+    }
+
     // ── Release asset helpers ─────────────────────────────────────────────────
 
-    pub async fn get_asset_id(&self, name: &str) -> Result<Option<u64>, String> {
-        #[derive(Deserialize)]
-        struct Asset {
-            id: u64,
-            name: String,
+    async fn list_assets(&self) -> Result<Vec<Asset>, String> {
+        const PER_PAGE: usize = 100;
+        let mut all = Vec::new();
+        for page in 1.. {
+            let batch: Vec<Asset> = self
+                .http
+                .get(format!(
+                    "{API_BASE}/repos/{}/{REPO_NAME}/releases/{}/assets?per_page={PER_PAGE}&page={page}",
+                    self.username, self.release_id
+                ))
+                .headers(self.api_headers())
+                .send()
+                .await
+                .map_err(|e| format!("Asset list failed: {e}"))?
+                .error_for_status()
+                .map_err(|e| format!("Asset list error: {e}"))?
+                .json()
+                .await
+                .map_err(|e| format!("Asset list parse error: {e}"))?;
+            let done = batch.len() < PER_PAGE;
+            all.extend(batch);
+            if done {
+                break;
+            }
         }
+        Ok(all)
+    }
 
-        let assets: Vec<Asset> = self
-            .http
-            .get(format!(
-                "{API_BASE}/repos/{}/{REPO_NAME}/releases/{}/assets",
-                self.username, self.release_id
-            ))
-            .headers(self.api_headers())
-            .send()
-            .await
-            .map_err(|e| format!("Asset list failed: {e}"))?
-            .error_for_status()
-            .map_err(|e| format!("Asset list error: {e}"))?
-            .json()
-            .await
-            .map_err(|e| format!("Asset list parse error: {e}"))?;
-
-        Ok(assets.into_iter().find(|a| a.name == name).map(|a| a.id))
+    pub async fn get_asset_id(&self, name: &str) -> Result<Option<u64>, String> {
+        Ok(self
+            .list_assets()
+            .await?
+            .into_iter()
+            .find(|a| a.name == name)
+            .map(|a| a.id))
     }
 
     pub async fn delete_asset(&self, asset_id: u64) -> Result<(), String> {
@@ -630,31 +717,31 @@ impl GitHubClient {
         Ok(())
     }
 
-    /// Upload a profile bundle for the given machine_id + index slot.
-    pub async fn upload_profile(
+    /// Upload a snapshot bundle for the given machine_id + index slot.
+    pub async fn upload_snapshot(
         &self,
         machine_id: &str,
         index: u8,
         data: &[u8],
     ) -> Result<(), String> {
-        let name = format!("profile-{machine_id}-{index}.enc");
+        let name = snapshot_asset_name(machine_id, index);
         if let Some(id) = self.get_asset_id(&name).await? {
             self.delete_asset(id).await?;
         }
         self.upload_asset(&name, data, "application/octet-stream").await
     }
 
-    pub async fn download_profile(
+    pub async fn download_snapshot(
         &self,
         machine_id: &str,
         index: u8,
     ) -> Result<Vec<u8>, String> {
-        let name = format!("profile-{machine_id}-{index}.enc");
+        let name = snapshot_asset_name(machine_id, index);
         crate::zslog!("[github] downloading '{}'", name);
         let asset_id = self
             .get_asset_id(&name)
             .await?
-            .ok_or_else(|| format!("Profile asset '{name}' not found"))?;
+            .ok_or_else(|| format!("Snapshot asset '{name}' not found"))?;
 
         let download_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
@@ -673,25 +760,25 @@ impl GitHubClient {
             })
             .send()
             .await
-            .map_err(|e| format!("Profile download failed: {e}"))?
+            .map_err(|e| format!("Snapshot download failed: {e}"))?
             .error_for_status()
-            .map_err(|e| format!("Profile download error: {e}"))?
+            .map_err(|e| format!("Snapshot download error: {e}"))?
             .bytes()
             .await
-            .map_err(|e| format!("Profile read failed: {e}"))?
+            .map_err(|e| format!("Snapshot read failed: {e}"))?
             .to_vec();
         crate::zslog!("[github] downloaded {} bytes", bytes.len());
         Ok(bytes)
     }
 
-    /// Delete all profile assets for expired snapshot slots.
-    pub async fn delete_profile_assets(
+    /// Delete all snapshot assets for expired slots.
+    pub async fn delete_snapshot_assets(
         &self,
         machine_id: &str,
         indices: &[u8],
     ) -> Result<(), String> {
         for &idx in indices {
-            let name = format!("profile-{machine_id}-{idx}.enc");
+            let name = snapshot_asset_name(machine_id, idx);
             if let Some(id) = self.get_asset_id(&name).await? {
                 self.delete_asset(id).await?;
                 crate::zslog!("[github] deleted expired asset '{}'", name);

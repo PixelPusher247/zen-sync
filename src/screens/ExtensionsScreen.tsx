@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { bridge } from "../bridge";
+import { formatBytes } from "../format";
 import type { ExtensionWithSelection } from "../types";
 
 interface Props {
@@ -54,13 +55,10 @@ export default function ExtensionsScreen({ onBack }: Props) {
     setSaving(true);
     setError(null);
     try {
-      // Empty array = sync all; otherwise pass selected IDs
       const selectedIds = extensions
         ?.filter((e) => toggles[e.id] ?? true)
         .map((e) => e.id) ?? [];
-      // If all are selected, store empty (meaning "all") to keep it clean
-      const toStore = selectedIds.length === (extensions?.length ?? 0) ? [] : selectedIds;
-      await bridge.setExtensionSelection(toStore);
+      await bridge.setExtensionSelection(selectedIds);
       setSaved(true);
       setTimeout(() => setSaved(false), 2500);
     } catch (e) {
@@ -84,7 +82,7 @@ export default function ExtensionsScreen({ onBack }: Props) {
         <div className="flex-1">
           <h2 className="text-sm font-semibold text-white">Extensions</h2>
           <p className="text-xs text-muted">
-            Choose which extensions to include in backups
+            Choose which extensions' local data to include in backups
           </p>
         </div>
         {extensions && extensions.length > 0 && (
@@ -137,7 +135,10 @@ export default function ExtensionsScreen({ onBack }: Props) {
           <>
             <p className="text-xs text-muted">
               {Object.values(toggles).filter(Boolean).length} of{" "}
-              {extensions.length} extensions will be synced.
+              {extensions.length} extensions will be backed up: their local
+              storage, granted permissions and custom shortcuts. Password
+              managers are off by default because their data includes your
+              account session.
             </p>
 
             <div className="flex flex-col gap-1.5">
@@ -172,11 +173,17 @@ export default function ExtensionsScreen({ onBack }: Props) {
 
                     {/* Info */}
                     <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-white truncate">
-                        {ext.name}
-                      </p>
+                      <div className="flex items-center gap-2 min-w-0">
+                        <p className="text-sm font-medium text-white truncate">
+                          {ext.name}
+                        </p>
+                        {ext.passwordManager && (
+                          <span className="badge-warning shrink-0">Password manager</span>
+                        )}
+                      </div>
                       <p className="text-xs text-muted truncate">
-                        v{ext.version}
+                        v{ext.version} ·{" "}
+                        {ext.storageBytes > 0 ? formatBytes(ext.storageBytes) : "no local storage"}
                         {!ext.enabled && (
                           <span className="ml-2 opacity-60">(disabled)</span>
                         )}

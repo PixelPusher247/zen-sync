@@ -1,173 +1,22 @@
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
+use crate::bundle::{self, RestoreReport};
 use crate::github::{GitHubClient, MachineMetadata, SnapshotEntry, SyncMetadata};
-use crate::{crypto, extensions, prefs, profile};
+use crate::{crypto, profile};
 
-#[derive(Serialize, Deserialize)]
-struct SyncBundle {
-    version: u8,
-    created_at: u64,
-    /// filename → base64-encoded bytes
-    files: HashMap<String, String>,
-}
+/// Pre-restore safety copies kept in the app config dir.
+const SAFETY_COPIES_TO_KEEP: usize = 3;
 
-fn checkpoint_wal(db_path: &Path) -> Result<(), String> {
-    let conn = rusqlite::Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-    )
-    .map_err(|e| format!("Could not open {}: {e}", db_path.display()))?;
-
-    let (busy, log, checkpointed): (i64, i64, i64) = conn
-        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })
-        .map_err(|e| format!("WAL checkpoint failed: {e}"))?;
-
-    crate::zslog!(
-        "[sync] WAL checkpoint: {checkpointed}/{log} pages written (busy_readers={busy})"
-    );
-    Ok(())
-}
-
-fn collect_files(
-    profile_dir: &Path,
-    selected_ext_ids: &[String],
-) -> Result<HashMap<String, String>, String> {
-    let mut files = HashMap::new();
-    for &name in profile::SYNC_FILES {
-        let path = profile_dir.join(name);
-        if !path.exists() {
-            crate::zslog!("[sync] skipping missing: {name}");
-            continue;
-        }
-        let bytes = match name {
-            "prefs.js" => {
-                let content = std::fs::read_to_string(&path)
-                    .map_err(|e| format!("Could not read prefs.js: {e}"))?;
-                prefs::strip_machine_prefs(&content).into_bytes()
-            }
-            "extensions.json" => {
-                let raw = std::fs::read(&path)
-                    .map_err(|e| format!("Could not read extensions.json: {e}"))?;
-                extensions::filter_extensions(&raw, selected_ext_ids)
-                    .map_err(|e| format!("extensions.json filter failed: {e}"))?
-            }
-            _ => std::fs::read(&path)
-                .map_err(|e| format!("Could not read {name}: {e}"))?,
-        };
-        crate::zslog!("[sync] collected {name} ({} bytes)", bytes.len());
-        files.insert(name.to_string(), BASE64.encode(&bytes));
-    }
-    // Walk chrome/zen-themes/ for per-mod chrome.css and preferences.json
-    for (key, abs_path) in profile::zen_themes_files(profile_dir) {
-        let bytes = std::fs::read(&abs_path)
-            .map_err(|e| format!("Could not read {key}: {e}"))?;
-        crate::zslog!("[sync] collected {key} ({} bytes)", bytes.len());
-        files.insert(key, BASE64.encode(&bytes));
-    }
-
-    if files.is_empty() {
-        return Err("No sync files found in the Zen profile folder".into());
-    }
-    Ok(files)
-}
-
-fn write_files(
-    profile_dir: &Path,
-    bundle: &SyncBundle,
-    selected_ext_ids: &[String],
-) -> Result<Vec<String>, String> {
-    let file_names: Vec<String> = bundle.files.keys().cloned().collect();
-    local_backup(profile_dir, &file_names)?;
-
-    let mut written = Vec::new();
-    for (name, b64) in &bundle.files {
-        let bytes = BASE64
-            .decode(b64)
-            .map_err(|e| format!("Failed to decode {name}: {e}"))?;
-        let dest = profile_dir.join(name);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create dir for {name}: {e}"))?;
-        }
-
-        let final_bytes = match name.as_str() {
-            "prefs.js" => {
-                // Re-inject per-machine keys so the local device identity is preserved.
-                let local_content = if dest.exists() {
-                    std::fs::read_to_string(&dest).unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                let restored_content = String::from_utf8_lossy(&bytes).into_owned();
-                prefs::restore_machine_prefs(&restored_content, &local_content).into_bytes()
-            }
-            "extensions.json" => {
-                // Merge: only update selected extensions, preserve local ones.
-                let local_bytes = if dest.exists() {
-                    std::fs::read(&dest).unwrap_or_default()
-                } else {
-                    bytes.clone()
-                };
-                if local_bytes.is_empty() {
-                    bytes
-                } else {
-                    extensions::merge_extensions(&bytes, &local_bytes, selected_ext_ids)
-                        .unwrap_or(bytes)
-                }
-            }
-            _ => bytes,
-        };
-
-        std::fs::write(&dest, &final_bytes)
-            .map_err(|e| format!("Failed to write {name}: {e}"))?;
-
-        // Remove SQLite WAL/SHM files so the browser re-opens the DB cleanly.
-        if name.ends_with(".sqlite") {
-            let _ = std::fs::remove_file(profile_dir.join(format!("{name}-wal")));
-            let _ = std::fs::remove_file(profile_dir.join(format!("{name}-shm")));
-        }
-        written.push(name.clone());
-    }
-    written.sort();
-    Ok(written)
-}
-
-/// Create a timestamped local backup of the listed profile files before overwriting.
-fn local_backup(profile_dir: &Path, file_names: &[String]) -> Result<(), String> {
-    let ts = std::time::SystemTime::now()
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
-    let backup_dir = profile_dir.join(format!("zen-sync-backup-{ts}"));
-    std::fs::create_dir_all(&backup_dir)
-        .map_err(|e| format!("Failed to create local backup dir: {e}"))?;
-    for name in file_names {
-        let src = profile_dir.join(name);
-        if src.exists() {
-            let dest = backup_dir.join(name);
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("Failed to create backup subdir: {e}"))?;
-            }
-            std::fs::copy(&src, dest)
-                .map_err(|e| format!("Failed to backup {name}: {e}"))?;
-        }
-    }
-    crate::zslog!("[sync] local backup created at {}", backup_dir.display());
-    Ok(())
+        .as_secs()
 }
 
 fn now_iso() -> String {
-    let s = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    epoch_to_iso(s)
+    epoch_to_iso(now_epoch())
 }
 
 fn epoch_to_iso(epoch: u64) -> String {
@@ -193,39 +42,44 @@ fn epoch_to_iso(epoch: u64) -> String {
     format!("{y:04}-{mo:02}-{:02}T{hour:02}:{min:02}:{sec:02}Z", days + 1)
 }
 
-/// Back up the current profile to GitHub.
+/// Back up Sine mods and extension data to GitHub.
 /// Returns the ISO timestamp of the backup.
 pub async fn backup(
     client: &GitHubClient,
     machine_name: &str,
     machine_id: &str,
     max_snapshots: u8,
-    selected_ext_ids: &[String],
+    overrides: BTreeMap<String, bool>,
+    delete_legacy: bool,
     on_progress: impl Fn(&str) + Send,
 ) -> Result<String, String> {
+    on_progress("Checking for old snapshots…");
+    let legacy = client.find_legacy_snapshots().await?;
+    if !legacy.is_empty() && !delete_legacy {
+        return Err(
+            "Old full-profile snapshots must be deleted before the first backup in the new format."
+                .into(),
+        );
+    }
+
     on_progress("Finding Zen profile…");
     let profile_dir = profile::find_zen_profile()
         .ok_or("Zen profile folder not found. Is Zen Browser installed?")?;
     crate::zslog!("[sync] backup: profile at {}", profile_dir.display());
 
-    let places_path = profile_dir.join("places.sqlite");
-    if places_path.exists() {
-        on_progress("Checkpointing database…");
-        checkpoint_wal(&places_path)?;
-    }
-
-    on_progress("Collecting files…");
-    let files = collect_files(&profile_dir, selected_ext_ids)?;
-
-    let created_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    on_progress("Collecting mods and extension data…");
+    let (archive, manifest) =
+        tokio::task::spawn_blocking(move || bundle::build(&profile_dir, &overrides))
+            .await
+            .map_err(|e| format!("Backup task failed: {e}"))??;
+    crate::zslog!(
+        "[sync] backup: bundle {} bytes, {} extensions",
+        archive.len(),
+        manifest.extensions.len()
+    );
 
     on_progress("Encrypting…");
-    let bundle = SyncBundle { version: 1, created_at, files };
-    let json = serde_json::to_vec(&bundle).map_err(|e| e.to_string())?;
-    let encrypted = crypto::encrypt(&json, &client.encryption_key)?;
+    let encrypted = crypto::encrypt(&archive, &client.encryption_key)?;
     crate::zslog!("[sync] backup: encrypted {} bytes", encrypted.len());
 
     on_progress("Reading current backup list…");
@@ -255,13 +109,13 @@ pub async fn backup(
 
     on_progress("Uploading…");
     crate::zslog!("[sync] backup: uploading to slot {index} for machine '{machine_id}'");
-    client.upload_profile(machine_id, index, &encrypted).await?;
+    client.upload_snapshot(machine_id, index, &encrypted).await?;
 
     // Delete any evicted asset
     if !expired_indices.is_empty() {
         on_progress("Pruning old snapshots…");
         client
-            .delete_profile_assets(machine_id, &expired_indices)
+            .delete_snapshot_assets(machine_id, &expired_indices)
             .await?;
     }
 
@@ -292,56 +146,99 @@ pub async fn backup(
 
     on_progress("Saving backup list…");
     client.write_metadata(&metadata, sha.as_deref()).await?;
+
+    // Only remove the old format once the new snapshot is safely stored.
+    if !legacy.is_empty() {
+        on_progress("Deleting old snapshots…");
+        client.delete_legacy_snapshots(&legacy).await?;
+    }
+
     crate::zslog!("[sync] backup: done at {pushed_at}");
     Ok(pushed_at)
 }
 
-/// Restore a profile snapshot from GitHub.
+/// Restore a snapshot from GitHub into the local profile.
 pub async fn restore(
     client: &GitHubClient,
     machine_id: &str,
     index: u8,
-    selected_ext_ids: &[String],
+    overrides: BTreeMap<String, bool>,
+    safety_root: PathBuf,
     on_progress: impl Fn(&str) + Send,
-) -> Result<Vec<String>, String> {
+) -> Result<RestoreReport, String> {
     on_progress("Downloading…");
     crate::zslog!("[sync] restore: fetching machine '{machine_id}' slot {index}");
-    let encrypted = client.download_profile(machine_id, index).await?;
+    let encrypted = client.download_snapshot(machine_id, index).await?;
 
     on_progress("Decrypting…");
-    let json = crypto::decrypt(&encrypted, &client.encryption_key)?;
-
-    let bundle: SyncBundle = serde_json::from_slice(&json)
-        .map_err(|e| format!("Bundle format error: {e}"))?;
-    crate::zslog!(
-        "[sync] restore: bundle v{}, {} files",
-        bundle.version,
-        bundle.files.len()
-    );
-
-    if bundle.version != 1 {
-        return Err(format!(
-            "Unsupported bundle version {} — update zen-sync",
-            bundle.version
-        ));
-    }
+    let archive = crypto::decrypt(&encrypted, &client.encryption_key)?;
 
     let profile_dir = profile::find_zen_profile()
         .ok_or("Zen profile folder not found.")?;
     crate::zslog!("[sync] restore: writing to {}", profile_dir.display());
 
     on_progress("Writing files…");
-    let written = write_files(&profile_dir, &bundle, selected_ext_ids)?;
-    crate::zslog!("[sync] restore: wrote {} files", written.len());
-    Ok(written)
+    let safety_dir = safety_root.join(now_epoch().to_string());
+    let report = tokio::task::spawn_blocking(move || {
+        let result = bundle::apply(&profile_dir, &archive, &overrides, &safety_dir);
+        prune_safety_copies(&safety_root);
+        result.map_err(|e| {
+            if safety_dir.exists() {
+                format!("{e}\n\nFiles from before the restore were saved to {}", safety_dir.display())
+            } else {
+                e
+            }
+        })
+    })
+    .await
+    .map_err(|e| format!("Restore task failed: {e}"))??;
+
+    crate::zslog!(
+        "[sync] restore: {} mods, {} extensions, {} warnings",
+        report.mod_count,
+        report.extension_count,
+        report.warnings.len()
+    );
+    Ok(report)
+}
+
+/// Keep only the newest safety copies. Folder names are epoch seconds.
+fn prune_safety_copies(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    let excess = dirs.len().saturating_sub(SAFETY_COPIES_TO_KEEP);
+    for dir in dirs.into_iter().take(excess) {
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => crate::zslog!("[sync] removed old safety copy {}", dir.display()),
+            Err(e) => crate::zslog!("[sync] could not remove {}: {e}", dir.display()),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn epoch_to_iso_known() {
         assert_eq!(epoch_to_iso(1779235200), "2026-05-20T00:00:00Z");
+    }
+
+    #[test]
+    fn prunes_all_but_newest_safety_copies() {
+        let root = tempdir().unwrap();
+        for ts in ["1789000001", "1789000002", "1789000003", "1789000004"] {
+            std::fs::create_dir_all(root.path().join(ts)).unwrap();
+        }
+        prune_safety_copies(root.path());
+        assert!(!root.path().join("1789000001").exists());
+        assert!(root.path().join("1789000004").exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), SAFETY_COPIES_TO_KEEP);
     }
 }

@@ -37,8 +37,11 @@ tokio = { version = "1", features = ["full"] }
 # OS keychain for token + encryption key storage
 keyring = { version = "3", features = ["windows-native"] }
 
-# SQLite WAL checkpoint for places.sqlite
+# Extension storage: IndexedDB WAL checkpoint and origin rewrite
 rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Snapshot archive format
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 # Machine hostname
 hostname = "0.4"

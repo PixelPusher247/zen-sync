@@ -28,6 +28,24 @@ export interface ExtensionWithSelection {
   enabled: boolean;
   iconUrl: string | null;
   synced: boolean;
+  /** Size of the extension's storage.local folder (0 if it has none). */
+  storageBytes: number;
+  passwordManager: boolean;
+}
+
+export interface BackupSummary {
+  sineInstalled: boolean;
+  sineEngineVersion: string | null;
+  modCount: number;
+  modSettingCount: number;
+  extensionCount: number;
+  storageBytes: number;
+}
+
+export interface RestoreReport {
+  modCount: number;
+  extensionCount: number;
+  warnings: string[];
 }
 
 export type Screen = "setup" | "dashboard" | "snapshots" | "settings" | "extensions";

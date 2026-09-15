@@ -4,7 +4,7 @@
 
 # Zen Sync
 
-**Encrypted Zen Browser profile backups, on demand.**
+**Encrypted backups of your Zen Browser mods and extension data, on demand.**
 
 [![Version](https://img.shields.io/github/v/release/PixelPusher247/zen-sync?style=flat-square&color=7c6af7&label=version)](https://github.com/PixelPusher247/zen-sync/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078d4?style=flat-square)](#installation)
@@ -14,7 +14,7 @@
 
 ---
 
-[Zen Browser](https://www.zen-browser.app/) stores workspaces, pinned tabs, themes, and shortcuts in its own data — none of which Firefox Sync covers. Zen Sync backs all of that up to a private GitHub repository, encrypted, whenever you choose.
+[Zen Browser](https://www.zen-browser.app/) syncs spaces, containers, bookmarks and extension `storage.sync` data through your Mozilla account. Two things are still left out: [Sine](https://github.com/CosmoCreeper/Sine) mods with their settings, and the settings extensions keep in `storage.local`. Zen Sync backs up exactly those to a private GitHub repository, encrypted, whenever you choose.
 
 Unlike [Zync](https://github.com/PixelPusher247/zync), there are no background daemons, no automatic triggers, and no network activity unless you click a button.
 
@@ -33,9 +33,9 @@ Unlike [Zync](https://github.com/PixelPusher247/zync), there are no background d
                      on restore
 ```
 
-1. **Backup** — Click "Backup Now". Zen Sync collects your profile files, strips per-machine keys from `prefs.js`, filters to your chosen extensions, encrypts everything with AES-256-GCM, and uploads the bundle as a release asset to a private `zen-sync-backup` repo in your GitHub account.
-2. **Restore** — Open the History screen, pick any snapshot from any device, and click Restore. The bundle is downloaded, decrypted, and written to your profile. Per-machine preferences (device name, Firefox Sync account) are re-injected from the local device so they are never overwritten.
-3. **Zen must be closed** — All operations are hard-blocked if Zen Browser is running, preventing SQLite corruption and the browser-state weirdness that can occur when profile files are replaced while the browser holds them open.
+1. **Backup** — Click "Backup Now". Zen Sync zips your Sine mods, the values of the settings those mods declare, and the data of your selected extensions, encrypts the archive with AES-256-GCM, and uploads it as a release asset to a private `zen-sync-backup` repo in your GitHub account.
+2. **Restore** — Open the History screen, pick any snapshot from any device, and click Restore. Your mods folder is replaced with the snapshot's, mod settings are written into `prefs.js` one by one, and extension storage is copied in. Extension storage is tied to a per-profile UUID, so Zen Sync rewrites it to match the UUID the extension has on this device. Nothing else in `prefs.js` is touched, so device name and Mozilla account stay as they are.
+3. **Zen must be closed** — All operations are hard-blocked if Zen Browser is running, preventing database corruption and conflicting writes to files the browser holds open.
 
 ---
 
@@ -44,8 +44,8 @@ Unlike [Zync](https://github.com/PixelPusher247/zync), there are no background d
 - **Manual only** — no background sync, no auto-triggers, no network use at rest
 - **AES-256-GCM encryption** with PBKDF2-HMAC-SHA256 key derivation (100 k rounds); GitHub never sees plaintext data
 - **Encryption key in OS keychain** — stored in Windows Credential Manager, never on disk
-- **Device name isolation** — `services.sync.*` and `identity.fxaccounts.*` keys are stripped before upload and restored from the local device, so each machine keeps its own Firefox Sync identity
-- **Per-extension selection** — choose exactly which extensions to include in backups; non-selected extensions on the target device are left untouched
+- **Works alongside Mozilla sync** — only data native sync doesn't cover is backed up; device identity and sync-account prefs are never read or written
+- **Per-extension selection** — choose which extensions' data to include; password managers are excluded by default because their local storage holds your account session
 - **Snapshot history** — keeps the last N snapshots per device (default 3, configurable 1–10); restore any of them from the History screen
 - **Cross-device restore** — snapshots from all your devices appear in the History screen; you can restore any device's backup onto any other device
 - **Auto-updater** — in-app update banner when a new version is released
@@ -55,19 +55,15 @@ Unlike [Zync](https://github.com/PixelPusher247/zync), there are no background d
 
 ## What gets synced
 
-| File | Contents |
-|------|----------|
-| `places.sqlite` | Pinned tabs, workspaces, bookmarks |
-| `prefs.js` | Browser preferences — per-machine keys excluded |
-| `extensions.json` | Extension list — selectable per extension |
-| `zen-themes.json` | Mods/themes configuration |
-| `zen-keyboard-shortcuts.json` | Keyboard shortcuts |
-| `zen-sessions.jsonlz4` | Workspace names, tab assignments, themes |
-| `zen-live-folders.jsonlz4` | Live folders |
-| `chrome/zen-themes.css` | Compiled active mod styles |
-| `containers.json` | Workspace icons and colors |
+| Data | Source |
+|------|--------|
+| Sine mods | `chrome/sine-mods/` (except `chrome.css` / `content.css`, which Sine regenerates on startup) |
+| Mod settings | Values in `prefs.js` for every `property` declared in a mod's `preferences.json`, plus Sine's own settings |
+| Extension storage | `storage/default/moz-extension+++<uuid>^userContextId=4294967295/` (`storage.local`) |
+| Extension permissions | The extension's entry in `extension-preferences.json` |
+| Extension shortcuts | The extension's entries under `commands` in `extension-settings.json` |
 
-**Never synced:** passwords (`key4.db`, `logins.json`), extension storage, session cache.
+**Left to Mozilla sync:** spaces, containers, bookmarks, history, passwords, installed extensions, `storage.sync`. The Sine engine itself (`chrome/JS/`) must be installed on each device.
 
 ---
 
@@ -89,7 +85,8 @@ Download the latest Windows installer from the [Releases](https://github.com/Pix
 - Profile bundles are encrypted with **AES-256-GCM** before leaving your machine
 - The encryption key is auto-generated on first connect and stored in **Windows Credential Manager** — it never touches disk in plaintext
 - The backup repository is **private** and owned by your GitHub account
-- A local timestamped backup (`zen-sync-backup-{timestamp}/`) is created inside your profile directory before every restore, giving you a manual rollback path independent of the GitHub history
+- Before every restore, the files it will replace are copied to `%APPDATA%\app.zen.zensync\restore-backups\{timestamp}\` (the last 3 are kept), giving you a manual rollback path independent of the GitHub history
+- Upgrading from 0.1.x: the first backup deletes the old full-profile snapshots from GitHub after asking for confirmation
 
 ---
 

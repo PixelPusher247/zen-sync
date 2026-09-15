@@ -148,7 +148,7 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
           className="flex items-center justify-between w-full -mx-4 px-4 py-2 rounded-xl
                      hover:bg-surface-overlay transition-colors group"
         >
-          <span className="text-sm text-white">Extensions to sync</span>
+          <span className="text-sm text-white">Extensions to back up</span>
           <span className="text-muted text-xs group-hover:text-accent transition-colors">
             ›
           </span>

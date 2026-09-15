@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 const STATE_FILE: &str = "state.json";
@@ -9,9 +10,10 @@ pub struct LocalState {
     pub last_backup_at: Option<String>,
     pub snapshot_count: u8,
     pub autostart_enabled: bool,
-    /// Extension IDs to include in backups. Empty = sync all user extensions.
+    /// Per-extension include/exclude choices that differ from the default
+    /// (included, unless it's a password manager). Keyed by extension ID.
     #[serde(default)]
-    pub selected_extension_ids: Vec<String>,
+    pub extension_overrides: BTreeMap<String, bool>,
 }
 
 impl Default for LocalState {
@@ -21,7 +23,7 @@ impl Default for LocalState {
             last_backup_at: None,
             snapshot_count: 3,
             autostart_enabled: false,
-            selected_extension_ids: Vec::new(),
+            extension_overrides: BTreeMap::new(),
         }
     }
 }
@@ -74,7 +76,10 @@ mod tests {
             last_backup_at: Some("2026-01-01T00:00:00Z".into()),
             snapshot_count: 5,
             autostart_enabled: true,
-            selected_extension_ids: vec!["ext-a@test".into(), "ext-b@test".into()],
+            extension_overrides: BTreeMap::from([
+                ("ext-a@test".to_string(), false),
+                ("ext-b@test".to_string(), true),
+            ]),
         };
         orig.save(dir.path()).unwrap();
         let loaded = LocalState::load(dir.path());
@@ -82,12 +87,13 @@ mod tests {
     }
 
     #[test]
-    fn old_state_without_extension_ids_deserializes() {
-        // Simulates loading a state.json written before selected_extension_ids was added
+    fn old_state_with_selected_extension_ids_deserializes() {
+        // state.json written by 0.1.x, whose selection referred to extensions.json entries
         let dir = tempdir().unwrap();
-        let json = r#"{"machine_name":"PC","snapshot_count":3,"autostart_enabled":false}"#;
+        let json = r#"{"machine_name":"PC","snapshot_count":3,"autostart_enabled":false,"selected_extension_ids":["a@b"]}"#;
         std::fs::write(dir.path().join("state.json"), json).unwrap();
         let s = LocalState::load(dir.path());
-        assert!(s.selected_extension_ids.is_empty());
+        assert_eq!(s.machine_name, "PC");
+        assert!(s.extension_overrides.is_empty());
     }
 }

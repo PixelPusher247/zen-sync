@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { bridge } from "../bridge";
-import type { AppStatus, SnapshotInfo } from "../types";
+import type { AppStatus, RestoreReport, SnapshotInfo } from "../types";
 import ZenRunningGuard from "../components/ZenRunningGuard";
 
 interface Props {
@@ -26,7 +26,7 @@ export default function SnapshotsScreen({ onStatusChange }: Props) {
   const [loading, setLoading] = useState(true);
   const [restoringKey, setRestoringKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [restored, setRestored] = useState<string | null>(null);
+  const [restored, setRestored] = useState<RestoreReport | null>(null);
   const [zenRunning, setZenRunning] = useState(false);
 
   useEffect(() => {
@@ -44,15 +44,27 @@ export default function SnapshotsScreen({ onStatusChange }: Props) {
 
   async function handleRestore(index: number, machineId: string) {
     if (zenRunning) return;
+    if (
+      !confirm(
+        "Restore this snapshot? Your Sine mods, mod settings and the selected " +
+          "extensions' data on this device will be replaced. The current files " +
+          "are saved locally first."
+      )
+    ) {
+      return;
+    }
     const key = `${machineId}-${index}`;
     setRestoringKey(key);
     setError(null);
+    setRestored(null);
     try {
-      await bridge.restoreSnapshot(index, machineId);
+      const report = await bridge.restoreSnapshot(index, machineId);
       const s = await bridge.getStatus();
       onStatusChange(s);
-      setRestored(key);
-      setTimeout(() => setRestored(null), 4000);
+      setRestored(report);
+      if (report.warnings.length === 0) {
+        setTimeout(() => setRestored(null), 4000);
+      }
     } catch (e) {
       setError(String(e));
     } finally {
@@ -82,7 +94,7 @@ export default function SnapshotsScreen({ onStatusChange }: Props) {
       {error && (
         <div className="p-3 bg-danger/10 border border-danger/20 rounded-xl text-sm text-danger">
           <p className="font-medium">Error</p>
-          <p className="text-xs mt-1 opacity-80">{error}</p>
+          <p className="text-xs mt-1 opacity-80 whitespace-pre-line">{error}</p>
           <button
             type="button"
             onClick={() => setError(null)}
@@ -94,9 +106,30 @@ export default function SnapshotsScreen({ onStatusChange }: Props) {
       )}
 
       {restored !== null && (
-        <div className="flex items-center gap-2 p-3 bg-success/10 border border-success/20 rounded-xl text-sm text-success animate-fade-in">
-          <span>✓</span>
-          <span>Snapshot restored successfully</span>
+        <div className="flex flex-col gap-2 animate-fade-in">
+          <div className="flex items-center gap-2 p-3 bg-success/10 border border-success/20 rounded-xl text-sm text-success">
+            <span>✓</span>
+            <span>
+              Restored {restored.modCount} mod{restored.modCount === 1 ? "" : "s"} and{" "}
+              {restored.extensionCount} extension{restored.extensionCount === 1 ? "" : "s"}
+            </span>
+          </div>
+          {restored.warnings.length > 0 && (
+            <div className="p-3 bg-warning/10 border border-warning/20 rounded-xl text-xs text-warning">
+              <ul className="flex flex-col gap-1 list-disc pl-4">
+                {restored.warnings.map((w) => (
+                  <li key={w}>{w}</li>
+                ))}
+              </ul>
+              <button
+                type="button"
+                onClick={() => setRestored(null)}
+                className="mt-2 underline opacity-70 hover:opacity-100"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -104,7 +137,7 @@ export default function SnapshotsScreen({ onStatusChange }: Props) {
         <div className="card p-6 text-center">
           <p className="text-muted text-sm">No snapshots yet.</p>
           <p className="text-muted text-xs mt-1">
-            Back up your profile to create a snapshot.
+            Back up your mods and extension data to create a snapshot.
           </p>
         </div>
       )}

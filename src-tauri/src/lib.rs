@@ -1,10 +1,14 @@
+mod bundle;
 mod crypto;
+mod ext_storage;
 mod extensions;
+mod fsutil;
 mod github;
 mod local_state;
 pub mod logger;
 mod prefs;
 mod profile;
+mod sine;
 mod sync;
 mod zen_check;
 
@@ -145,6 +149,8 @@ pub fn run() {
             connect_github_cmd,
             disconnect_github_cmd,
             backup_now_cmd,
+            get_legacy_snapshot_count_cmd,
+            get_backup_summary_cmd,
             get_snapshots_cmd,
             restore_snapshot_cmd,
             set_machine_name_cmd,
@@ -282,6 +288,7 @@ fn disconnect_github_cmd(
 
 #[tauri::command]
 async fn backup_now_cmd(
+    delete_legacy: bool,
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<(), String> {
@@ -291,7 +298,7 @@ async fn backup_now_cmd(
         );
     }
 
-    let (client, machine_name, machine_id, max_snapshots, selected_ext_ids, config_dir) = {
+    let (client, machine_name, machine_id, max_snapshots, overrides, config_dir) = {
         let s = state.lock().unwrap();
         let c = s.github_client.clone().ok_or("Not connected to GitHub")?;
         (
@@ -299,7 +306,7 @@ async fn backup_now_cmd(
             s.local_state.machine_name.clone(),
             s.machine_id(),
             s.local_state.snapshot_count,
-            s.local_state.selected_extension_ids.clone(),
+            s.local_state.extension_overrides.clone(),
             s.config_dir.clone(),
         )
     };
@@ -310,7 +317,8 @@ async fn backup_now_cmd(
         &machine_name,
         &machine_id,
         max_snapshots,
-        &selected_ext_ids,
+        overrides,
+        delete_legacy,
         move |msg| {
             let _ = app_p.emit("sync-progress", msg);
         },
@@ -324,6 +332,30 @@ async fn backup_now_cmd(
     }
     let _ = app.emit("sync-updated", ());
     Ok(())
+}
+
+/// Number of full-profile snapshots left over from zen-sync 0.1.x.
+#[tauri::command]
+async fn get_legacy_snapshot_count_cmd(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<usize, String> {
+    let client = {
+        let s = state.lock().unwrap();
+        s.github_client.clone().ok_or("Not connected to GitHub")?
+    };
+    let legacy = client.find_legacy_snapshots().await?;
+    // A leftover metadata file with no assets still needs cleaning up.
+    Ok(if legacy.is_empty() { 0 } else { legacy.asset_ids.len().max(1) })
+}
+
+#[tauri::command]
+fn get_backup_summary_cmd(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<bundle::BackupSummary, String> {
+    let profile_dir = profile::find_zen_profile()
+        .ok_or("Zen profile folder not found. Is Zen Browser installed?")?;
+    let overrides = state.lock().unwrap().local_state.extension_overrides.clone();
+    Ok(bundle::summarize(&profile_dir, &overrides))
 }
 
 #[tauri::command]
@@ -369,27 +401,31 @@ async fn restore_snapshot_cmd(
     machine_id: String,
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
-) -> Result<(), String> {
+) -> Result<bundle::RestoreReport, String> {
     if zen_check::is_zen_running() {
         return Err(
             "Zen Browser is open. Close it completely before restoring.".into(),
         );
     }
 
-    let (client, selected_ext_ids) = {
+    let (client, overrides, safety_root) = {
         let s = state.lock().unwrap();
         let c = s.github_client.clone().ok_or("Not connected to GitHub")?;
-        (c, s.local_state.selected_extension_ids.clone())
+        (
+            c,
+            s.local_state.extension_overrides.clone(),
+            s.config_dir.join("restore-backups"),
+        )
     };
 
     let app_p = app.clone();
-    sync::restore(&client, &machine_id, index, &selected_ext_ids, move |msg| {
+    let report = sync::restore(&client, &machine_id, index, overrides, safety_root, move |msg| {
         let _ = app_p.emit("sync-progress", msg);
     })
     .await?;
 
     let _ = app.emit("sync-updated", ());
-    Ok(())
+    Ok(report)
 }
 
 #[tauri::command]
@@ -424,6 +460,9 @@ pub struct ExtensionInfoWithSelection {
     pub enabled: bool,
     pub icon_url: Option<String>,
     pub synced: bool,
+    /// Size of the extension's storage.local folder in bytes (0 if it has none).
+    pub storage_bytes: u64,
+    pub password_manager: bool,
 }
 
 #[tauri::command]
@@ -433,22 +472,23 @@ fn get_extensions_with_selection_cmd(
     let profile_dir = profile::find_zen_profile()
         .ok_or("Zen profile folder not found. Is Zen Browser installed?")?;
     let list = extensions::list_extensions(&profile_dir)?;
-    let selected = state.lock().unwrap().local_state.selected_extension_ids.clone();
-    let sync_all = selected.is_empty();
-    let set: std::collections::HashSet<&str> =
-        selected.iter().map(|s| s.as_str()).collect();
+    let prefs_content = std::fs::read_to_string(profile_dir.join("prefs.js")).unwrap_or_default();
+    let uuids = ext_storage::uuid_map(&prefs_content).unwrap_or_default();
+    let overrides = state.lock().unwrap().local_state.extension_overrides.clone();
     let result = list
         .into_iter()
-        .map(|e| {
-            let synced = sync_all || set.contains(e.id.as_str());
-            ExtensionInfoWithSelection {
-                synced,
-                id: e.id,
-                name: e.name,
-                version: e.version,
-                enabled: e.enabled,
-                icon_url: e.icon_url,
-            }
+        .map(|e| ExtensionInfoWithSelection {
+            synced: extensions::is_selected(&overrides, &e.id, &e.name),
+            storage_bytes: uuids
+                .get(&e.id)
+                .map(|uuid| fsutil::dir_size(&ext_storage::storage_local_dir(&profile_dir, uuid)))
+                .unwrap_or(0),
+            password_manager: extensions::is_password_manager(&e.id, &e.name),
+            id: e.id,
+            name: e.name,
+            version: e.version,
+            enabled: e.enabled,
+            icon_url: e.icon_url,
         })
         .collect();
     Ok(result)
@@ -459,8 +499,11 @@ fn set_extension_selection_cmd(
     ids: Vec<String>,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<(), String> {
+    let profile_dir = profile::find_zen_profile()
+        .ok_or("Zen profile folder not found. Is Zen Browser installed?")?;
+    let installed = extensions::list_extensions(&profile_dir)?;
     let mut s = state.lock().unwrap();
-    s.local_state.selected_extension_ids = ids;
+    extensions::update_overrides(&mut s.local_state.extension_overrides, &installed, &ids);
     let config_dir = s.config_dir.clone();
     s.local_state.save(&config_dir)
 }

@@ -1,46 +1,35 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 /// Minimal representation of an addon entry from extensions.json.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct AddonEntry {
-    pub id: String,
+#[derive(Deserialize, Debug)]
+struct AddonEntry {
+    id: String,
     #[serde(rename = "defaultLocale")]
-    pub default_locale: Option<AddonLocale>,
+    default_locale: Option<AddonLocale>,
     #[serde(rename = "type")]
-    pub addon_type: Option<String>,
-    /// "app-builtin", "app-system-defaults", "app-global", "winreg-app-global" → skip
-    pub location: Option<String>,
-    pub version: Option<String>,
-    pub active: Option<bool>,
+    addon_type: Option<String>,
+    location: Option<String>,
+    version: Option<String>,
+    active: Option<bool>,
     #[serde(rename = "userDisabled")]
-    pub user_disabled: Option<bool>,
+    user_disabled: Option<bool>,
     /// Icon URLs keyed by pixel size ("48", "64", "128")
-    pub icons: Option<std::collections::HashMap<String, String>>,
-    /// Preserve all other fields verbatim during filter/merge
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
+    icons: Option<HashMap<String, String>>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct AddonLocale {
-    pub name: Option<String>,
-    pub description: Option<String>,
+#[derive(Deserialize, Debug)]
+struct AddonLocale {
+    name: Option<String>,
 }
 
-/// The top-level shape of extensions.json
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ExtensionsFile {
-    #[serde(rename = "schemaVersion")]
-    pub schema_version: Option<u32>,
-    pub addons: Vec<AddonEntry>,
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
+#[derive(Deserialize, Debug)]
+struct ExtensionsFile {
+    addons: Vec<AddonEntry>,
 }
 
-/// Flat info the frontend needs for displaying the extension list.
-#[derive(Serialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug)]
 pub struct ExtensionInfo {
     pub id: String,
     pub name: String,
@@ -49,20 +38,37 @@ pub struct ExtensionInfo {
     pub icon_url: Option<String>,
 }
 
+/// Extension IDs of password managers whose local storage holds account and
+/// device session state. Restoring that onto another machine can sign the
+/// extension out or confuse its device binding, so they are excluded by default.
+const PASSWORD_MANAGER_IDS: &[&str] = &[
+    "{446900e4-71c2-419f-a6a7-df9c091e268b}", // Bitwarden
+    "{d634138d-c276-4fc8-924b-40a0ea21d284}", // 1Password
+    "support@lastpass.com",                   // LastPass
+    "keepassxc-browser@keepassxc.org",        // KeePassXC-Browser
+];
+
+/// Name fragments that catch password managers not in the ID list.
+const PASSWORD_MANAGER_NAME_HINTS: &[&str] = &[
+    "password", "passwort", "bitwarden", "lastpass", "keepass", "dashlane", "proton pass",
+    "nordpass", "enpass", "roboform",
+];
+
 fn is_user_extension(addon: &AddonEntry) -> bool {
     // Only user-installed extensions; skip built-ins, themes, search plugins.
-    let addon_type = addon.addon_type.as_deref().unwrap_or("");
-    if addon_type != "extension" {
+    if addon.addon_type.as_deref() != Some("extension") {
         return false;
     }
     let location = addon.location.as_deref().unwrap_or("");
     !matches!(
         location,
         "app-builtin"
+            | "app-builtin-addons"
             | "app-system-defaults"
+            | "app-system-addons"
+            | "app-system-profile"
             | "app-global"
             | "winreg-app-global"
-            | "app-system-addons"
     )
 }
 
@@ -93,19 +99,16 @@ pub fn list_extensions(profile_dir: &Path) -> Result<Vec<ExtensionInfo>, String>
         .addons
         .iter()
         .filter(|a| is_user_extension(a))
-        .map(|a| {
-            let name = a
+        .map(|a| ExtensionInfo {
+            id: a.id.clone(),
+            name: a
                 .default_locale
                 .as_ref()
                 .and_then(|l| l.name.clone())
-                .unwrap_or_else(|| a.id.clone());
-            ExtensionInfo {
-                id: a.id.clone(),
-                name,
-                version: a.version.clone().unwrap_or_default(),
-                enabled: a.active.unwrap_or(true) && !a.user_disabled.unwrap_or(false),
-                icon_url: best_icon(a),
-            }
+                .unwrap_or_else(|| a.id.clone()),
+            version: a.version.clone().unwrap_or_default(),
+            enabled: a.active.unwrap_or(true) && !a.user_disabled.unwrap_or(false),
+            icon_url: best_icon(a),
         })
         .collect();
 
@@ -113,161 +116,108 @@ pub fn list_extensions(profile_dir: &Path) -> Result<Vec<ExtensionInfo>, String>
     Ok(result)
 }
 
-/// Filter an extensions.json byte payload to only include the given addon IDs
-/// (plus all non-extension entries like themes/search plugins which are always kept).
-/// Returns the filtered JSON bytes.
-pub fn filter_extensions(content: &[u8], selected_ids: &[String]) -> Result<Vec<u8>, String> {
-    if selected_ids.is_empty() {
-        // Empty selection means "all" — return as-is
-        return Ok(content.to_vec());
-    }
-    let mut file: ExtensionsFile = serde_json::from_slice(content)
-        .map_err(|e| format!("extensions.json parse error: {e}"))?;
-
-    let id_set: std::collections::HashSet<&str> =
-        selected_ids.iter().map(|s| s.as_str()).collect();
-
-    file.addons.retain(|a| {
-        // Always keep non-user-extension entries (themes, search engines, built-ins)
-        !is_user_extension(a) || id_set.contains(a.id.as_str())
-    });
-
-    serde_json::to_vec(&file).map_err(|e| format!("extensions.json serialize error: {e}"))
+pub fn is_password_manager(id: &str, name: &str) -> bool {
+    let name = name.to_lowercase();
+    PASSWORD_MANAGER_IDS.contains(&id)
+        || PASSWORD_MANAGER_NAME_HINTS.iter().any(|hint| name.contains(hint))
 }
 
-/// Merge restored extension entries into the local extensions.json.
-///
-/// For each addon in `restored` that is a user extension:
-///   - If its ID is in `selected_ids` (or selected_ids is empty = all), replace/add it
-///     in the local file.
-///   - All local addons not in the restored set are preserved as-is.
-///
-/// This prevents overwriting extensions the user chose not to sync.
-pub fn merge_extensions(
-    restored_content: &[u8],
-    local_content: &[u8],
+/// Whether an extension's data is included. Extensions without an explicit
+/// choice are included unless they look like a password manager.
+pub fn is_selected(overrides: &BTreeMap<String, bool>, id: &str, name: &str) -> bool {
+    overrides
+        .get(id)
+        .copied()
+        .unwrap_or_else(|| !is_password_manager(id, name))
+}
+
+/// Record the user's selection for the installed extensions, storing only
+/// choices that differ from the default. Overrides for extensions that aren't
+/// installed here are kept.
+pub fn update_overrides(
+    overrides: &mut BTreeMap<String, bool>,
+    installed: &[ExtensionInfo],
     selected_ids: &[String],
-) -> Result<Vec<u8>, String> {
-    let restored: ExtensionsFile = serde_json::from_slice(restored_content)
-        .map_err(|e| format!("Restored extensions.json parse error: {e}"))?;
-    let mut local: ExtensionsFile = serde_json::from_slice(local_content)
-        .map_err(|e| format!("Local extensions.json parse error: {e}"))?;
-
-    let id_set: std::collections::HashSet<&str> = if selected_ids.is_empty() {
-        // All user extensions in the restored bundle are applied
-        restored
-            .addons
-            .iter()
-            .filter(|a| is_user_extension(a))
-            .map(|a| a.id.as_str())
-            .collect()
-    } else {
-        selected_ids.iter().map(|s| s.as_str()).collect()
-    };
-
-    // Build a map of restored addons by ID
-    let restored_map: std::collections::HashMap<&str, &AddonEntry> = restored
-        .addons
-        .iter()
-        .map(|a| (a.id.as_str(), a))
-        .collect();
-
-    // Replace matching local entries with restored versions
-    for local_addon in &mut local.addons {
-        if id_set.contains(local_addon.id.as_str()) {
-            if let Some(&restored_addon) = restored_map.get(local_addon.id.as_str()) {
-                *local_addon = restored_addon.clone();
-            }
+) {
+    let selected: HashSet<&str> = selected_ids.iter().map(String::as_str).collect();
+    for ext in installed {
+        let on = selected.contains(ext.id.as_str());
+        if on != is_password_manager(&ext.id, &ext.name) {
+            overrides.remove(&ext.id);
+        } else {
+            overrides.insert(ext.id.clone(), on);
         }
     }
-
-    // Append restored addons that don't exist locally yet
-    let local_ids: std::collections::HashSet<String> =
-        local.addons.iter().map(|a| a.id.clone()).collect();
-    for restored_addon in &restored.addons {
-        if id_set.contains(restored_addon.id.as_str())
-            && !local_ids.contains(restored_addon.id.as_str())
-        {
-            local.addons.push(restored_addon.clone());
-        }
-    }
-
-    serde_json::to_vec(&local).map_err(|e| format!("extensions.json serialize error: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
-    fn make_extension(id: &str, name: &str) -> serde_json::Value {
-        serde_json::json!({
-            "id": id,
-            "type": "extension",
-            "location": "profile",
-            "version": "1.0",
-            "active": true,
-            "userDisabled": false,
-            "defaultLocale": { "name": name }
-        })
-    }
-
-    fn make_file(addons: Vec<serde_json::Value>) -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 36,
-            "addons": addons
-        }))
-        .unwrap()
+    fn info(id: &str, name: &str) -> ExtensionInfo {
+        ExtensionInfo {
+            id: id.into(),
+            name: name.into(),
+            version: "1.0".into(),
+            enabled: true,
+            icon_url: None,
+        }
     }
 
     #[test]
-    fn filter_keeps_selected() {
-        let content = make_file(vec![
-            make_extension("ext-a@test", "Ext A"),
-            make_extension("ext-b@test", "Ext B"),
-            make_extension("ext-c@test", "Ext C"),
-        ]);
-        let selected = vec!["ext-a@test".to_string(), "ext-c@test".to_string()];
-        let filtered = filter_extensions(&content, &selected).unwrap();
-        let file: ExtensionsFile = serde_json::from_slice(&filtered).unwrap();
-        let ids: Vec<&str> = file.addons.iter().map(|a| a.id.as_str()).collect();
-        assert!(ids.contains(&"ext-a@test"));
-        assert!(!ids.contains(&"ext-b@test"));
-        assert!(ids.contains(&"ext-c@test"));
+    fn lists_only_user_extensions() {
+        let dir = tempdir().unwrap();
+        let json = serde_json::json!({
+            "schemaVersion": 37,
+            "addons": [
+                { "id": "uBlock0@raymondhill.net", "type": "extension", "location": "app-profile",
+                  "version": "1.60", "defaultLocale": { "name": "uBlock Origin" } },
+                { "id": "formautofill@mozilla.org", "type": "extension", "location": "app-builtin-addons",
+                  "defaultLocale": { "name": "Form Autofill" } },
+                { "id": "default-theme@mozilla.org", "type": "theme", "location": "app-builtin" }
+            ]
+        });
+        std::fs::write(dir.path().join("extensions.json"), json.to_string()).unwrap();
+        let list = list_extensions(dir.path()).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "uBlock Origin");
     }
 
     #[test]
-    fn filter_empty_selection_keeps_all() {
-        let content = make_file(vec![
-            make_extension("ext-a@test", "Ext A"),
-            make_extension("ext-b@test", "Ext B"),
-        ]);
-        let filtered = filter_extensions(&content, &[]).unwrap();
-        let file: ExtensionsFile = serde_json::from_slice(&filtered).unwrap();
-        assert_eq!(file.addons.len(), 2);
+    fn password_managers_are_excluded_by_default() {
+        let none = BTreeMap::new();
+        assert!(!is_selected(&none, "{446900e4-71c2-419f-a6a7-df9c091e268b}", "Bitwarden"));
+        assert!(!is_selected(&none, "pm@example", "Proton Pass: Free Password Manager"));
+        assert!(is_selected(&none, "addon@darkreader.org", "Dark Reader"));
     }
 
     #[test]
-    fn merge_replaces_selected_preserves_others() {
-        let restored_content = make_file(vec![
-            make_extension("ext-a@test", "Ext A v2"),
-            make_extension("ext-b@test", "Ext B v2"),
-        ]);
-        let local_content = make_file(vec![
-            make_extension("ext-a@test", "Ext A v1"),
-            make_extension("ext-c@test", "Ext C local"),
-        ]);
-        // Only sync ext-a; ext-b should not appear, ext-c should be preserved
-        let selected = vec!["ext-a@test".to_string()];
-        let merged = merge_extensions(&restored_content, &local_content, &selected).unwrap();
-        let file: ExtensionsFile = serde_json::from_slice(&merged).unwrap();
-        let by_id: std::collections::HashMap<&str, &AddonEntry> =
-            file.addons.iter().map(|a| (a.id.as_str(), a)).collect();
-        // ext-a updated to v2
-        let a = by_id["ext-a@test"];
-        assert_eq!(a.default_locale.as_ref().unwrap().name.as_deref(), Some("Ext A v2"));
-        // ext-b not merged
-        assert!(!by_id.contains_key("ext-b@test"));
-        // ext-c preserved
-        assert!(by_id.contains_key("ext-c@test"));
+    fn overrides_store_only_non_default_choices() {
+        let installed = vec![
+            info("addon@darkreader.org", "Dark Reader"),
+            info("{446900e4-71c2-419f-a6a7-df9c091e268b}", "Bitwarden Password Manager"),
+            info("uBlock0@raymondhill.net", "uBlock Origin"),
+        ];
+        let mut overrides = BTreeMap::new();
+        overrides.insert("not-installed@ext".to_string(), false);
+
+        // Opt Bitwarden in, opt uBlock out, keep Dark Reader at its default.
+        let selected = vec![
+            "addon@darkreader.org".to_string(),
+            "{446900e4-71c2-419f-a6a7-df9c091e268b}".to_string(),
+        ];
+        update_overrides(&mut overrides, &installed, &selected);
+
+        assert_eq!(overrides.len(), 3);
+        assert!(overrides["{446900e4-71c2-419f-a6a7-df9c091e268b}"]);
+        assert!(!overrides["uBlock0@raymondhill.net"]);
+        assert!(!overrides["not-installed@ext"]);
+        for ext in &installed {
+            assert_eq!(
+                is_selected(&overrides, &ext.id, &ext.name),
+                selected.contains(&ext.id)
+            );
+        }
     }
 }

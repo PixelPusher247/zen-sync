@@ -1,7 +1,8 @@
 import { useState, useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { bridge } from "../bridge";
-import type { AppStatus } from "../types";
+import { formatBytes } from "../format";
+import type { AppStatus, BackupSummary } from "../types";
 import ZenRunningGuard from "../components/ZenRunningGuard";
 
 interface Props {
@@ -31,9 +32,15 @@ export default function DashboardScreen({ status, onStatusChange }: Props) {
   const [progress, setProgress] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [zenRunning, setZenRunning] = useState(false);
+  const [summary, setSummary] = useState<BackupSummary | null>(null);
+  const [summaryError, setSummaryError] = useState<string | null>(null);
 
   useEffect(() => {
     bridge.isZenRunning().then(setZenRunning).catch(() => {});
+    bridge
+      .getBackupSummary()
+      .then(setSummary)
+      .catch((e) => setSummaryError(String(e)));
   }, []);
 
   useEffect(() => {
@@ -48,10 +55,23 @@ export default function DashboardScreen({ status, onStatusChange }: Props) {
   async function handleBackup() {
     if (zenRunning) return;
     setOp("backing-up");
-    setProgress("Starting backup…");
+    setProgress("Checking for old snapshots…");
     setError(null);
     try {
-      await bridge.backupNow();
+      const legacyCount = await bridge.getLegacySnapshotCount();
+      if (
+        legacyCount > 0 &&
+        !confirm(
+          "Zen Sync now backs up only Sine mods and extension data. " +
+            "Everything else syncs through your Mozilla account in Zen.\n\n" +
+            `${legacyCount} old full-profile snapshot${legacyCount === 1 ? "" : "s"} ` +
+            "from all your devices will be deleted from GitHub after this backup. Continue?"
+        )
+      ) {
+        setOp("idle");
+        return;
+      }
+      await bridge.backupNow(legacyCount > 0);
       const s = await bridge.getStatus();
       onStatusChange(s);
       setOp("success");
@@ -151,31 +171,35 @@ export default function DashboardScreen({ status, onStatusChange }: Props) {
         </div>
       )}
 
-      {/* Profile info */}
+      {/* Backup contents */}
       <div className="card p-3">
-        <p className="section-label">Synced files</p>
-        <div className="flex flex-wrap gap-1.5 mt-1">
-          {[
-            "places.sqlite",
-            "prefs.js",
-            "extensions.json",
-            "zen-themes.json",
-            "zen-keyboard-shortcuts.json",
-            "zen-sessions.jsonlz4",
-            "zen-live-folders.jsonlz4",
-            "chrome/zen-themes.css",
-            "containers.json",
-          ].map((f) => (
-            <span
-              key={f}
-              className="px-2 py-0.5 bg-surface-overlay border border-surface-border rounded-md text-xs font-mono text-muted"
-            >
-              {f}
-            </span>
-          ))}
-        </div>
+        <p className="section-label">What's backed up</p>
+        {summary && (
+          <div className="flex flex-col gap-1.5 text-xs">
+            <div className="flex items-center justify-between">
+              <span className="text-muted">Sine mods</span>
+              <span className="text-white">
+                {summary.sineInstalled || summary.modCount > 0
+                  ? `${summary.modCount}${summary.sineEngineVersion ? ` · Sine ${summary.sineEngineVersion}` : ""}`
+                  : "Sine not installed"}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-muted">Mod settings</span>
+              <span className="text-white">{summary.modSettingCount}</span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-muted">Extensions</span>
+              <span className="text-white">
+                {summary.extensionCount} · {formatBytes(summary.storageBytes)}
+              </span>
+            </div>
+          </div>
+        )}
+        {summaryError && <p className="text-xs text-danger">{summaryError}</p>}
         <p className="text-xs text-muted mt-2">
-          Firefox Sync settings and device name are excluded from backups.
+          Spaces, containers, bookmarks and other browser data sync through your
+          Mozilla account in Zen.
         </p>
       </div>
     </div>

@@ -1,5 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AppStatus, ExtensionWithSelection, SnapshotInfo } from "./types";
+import type {
+  AppStatus,
+  BackupSummary,
+  ExtensionWithSelection,
+  RestoreReport,
+  SnapshotInfo,
+} from "./types";
 
 export const bridge = {
   getStatus: () => invoke<AppStatus>("get_status_cmd"),
@@ -9,12 +15,17 @@ export const bridge = {
   disconnectGithub: () => invoke<void>("disconnect_github_cmd"),
 
   // Progress updates arrive via the "sync-progress" event — listen separately.
-  backupNow: () => invoke<void>("backup_now_cmd"),
+  backupNow: (deleteLegacy: boolean) =>
+    invoke<void>("backup_now_cmd", { deleteLegacy }),
+
+  getLegacySnapshotCount: () => invoke<number>("get_legacy_snapshot_count_cmd"),
+
+  getBackupSummary: () => invoke<BackupSummary>("get_backup_summary_cmd"),
 
   getSnapshots: () => invoke<SnapshotInfo[]>("get_snapshots_cmd"),
 
   restoreSnapshot: (index: number, machineId: string) =>
-    invoke<void>("restore_snapshot_cmd", { index, machineId }),
+    invoke<RestoreReport>("restore_snapshot_cmd", { index, machineId }),
 
   setMachineName: (name: string) =>
     invoke<void>("set_machine_name_cmd", { name }),
