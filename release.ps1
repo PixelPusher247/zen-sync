@@ -16,6 +16,14 @@ if (git status --porcelain) {
     exit 1
 }
 
+$lockPath = "$PSScriptRoot\src-tauri\Cargo.lock"
+$lock = Get-Content $lockPath -Raw
+$lockPattern = '(\[\[package\]\]\r?\nname = "zen-sync"\r?\nversion = )"[^"]+"'
+if ($lock -notmatch $lockPattern) {
+    Write-Error "zen-sync entry not found in Cargo.lock"
+    exit 1
+}
+
 # Bump tauri.conf.json (in-place regex, preserves formatting)
 $confPath = "$PSScriptRoot\src-tauri\tauri.conf.json"
 $conf = Get-Content $confPath -Raw
@@ -38,9 +46,13 @@ $lines = $lines | ForEach-Object {
 }
 [IO.File]::WriteAllLines($cargoPath, $lines)
 
+# Bump the app's own entry in Cargo.lock so the next build doesn't leave it modified
+$lock = $lock -replace $lockPattern, "`$1`"$Version`""
+[IO.File]::WriteAllText($lockPath, $lock)
+
 Write-Host "Bumped version to $Version"
 
-git add src-tauri/tauri.conf.json src-tauri/Cargo.toml
+git add src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
 git commit -m "chore: release $tag"
 git tag $tag
 git push origin main
