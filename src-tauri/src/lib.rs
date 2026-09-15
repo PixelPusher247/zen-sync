@@ -168,6 +168,10 @@ pub fn run() {
 
 // ── Update handling ───────────────────────────────────────────────────────────
 
+/// Portable builds have no installation for the updater to replace.
+const PORTABLE: bool = cfg!(feature = "portable");
+const RELEASES_URL: &str = "https://github.com/PixelPusher247/zen-sync/releases";
+
 async fn check_for_updates(app: &tauri::AppHandle, manual: bool) {
     use tauri_plugin_notification::NotificationExt;
 
@@ -215,7 +219,7 @@ async fn check_for_updates(app: &tauri::AppHandle, manual: bool) {
 
     let _ = app.emit(
         "update-available",
-        serde_json::json!({ "version": version, "notes": notes }),
+        serde_json::json!({ "version": version, "notes": notes, "portable": PORTABLE }),
     );
 }
 
@@ -567,6 +571,17 @@ async fn install_update(
     app: tauri::AppHandle,
     store: tauri::State<'_, Arc<UpdateStore>>,
 ) -> Result<(), String> {
+    if PORTABLE {
+        // Running the installer would add a second, installed copy; send the
+        // user to the release page to download the new portable exe instead.
+        use tauri_plugin_opener::OpenerExt;
+        let version = store.version.lock().unwrap().clone().ok_or("No pending update")?;
+        return app
+            .opener()
+            .open_url(format!("{RELEASES_URL}/tag/v{version}"), None::<&str>)
+            .map_err(|e| format!("Failed to open browser: {e}"));
+    }
+
     let update = store
         .update
         .lock()

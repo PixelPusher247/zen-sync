@@ -133,77 +133,90 @@ and add these repository secrets:
 # Start the app in development mode (hot-reload)
 npm run dev
 
-# Build a production installer
+# Build the installers and the portable exe
 npm run build
 # Output: src-tauri/target/release/bundle/nsis/*.exe
 #         src-tauri/target/release/bundle/msi/*.msi
+#         src-tauri/target/release/bundle/portable/*-portable.exe
+
+# Build only the portable exe (no installer; update banner links to the download page)
+npm run build:portable
 ```
+
+Installer builds also sign the updater artifacts, so set
+`TAURI_SIGNING_PRIVATE_KEY` (see Step 4) before `npm run build`.
+`npm run build:portable` doesn't need it.
 
 ---
 
 ## Step 7 — Release a new version
 
-1. Update the version in `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml`
-2. Commit and push
-3. Create and push a version tag:
+Commit your changes, then run the release script with the new version:
 
 ```powershell
-git tag v0.2.0
-git push origin v0.2.0
+.\release.ps1 -Version 0.2.1
 ```
+
+It bumps the version in `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml`,
+commits, tags `v0.2.1`, and pushes `main` and the tag.
 
 The `release.yml` workflow runs automatically and:
 - Builds the Windows NSIS installer and MSI
 - Creates a GitHub Release with both installers attached
 - Uploads `latest.json` so existing installs can auto-update
+- Builds the portable exe and attaches it as `Zen.Sync_<version>_x64-portable.exe`
 
-Users running an older version will see an "Install update" banner in the app
-within 24 hours (or immediately from the tray → Check for updates).
+Users running an older version will see an update banner in the app within
+24 hours. Installed copies update in place; the portable exe opens the
+release page so the new exe can be downloaded.
 
 ---
 
 ## What gets synced
 
-| File | Purpose | Notes |
-|------|---------|-------|
-| `places.sqlite` | Bookmarks, pinned tabs, workspaces | WAL-checkpointed before backup |
-| `prefs.js` | Browser preferences | Per-machine keys stripped — see below |
-| `extensions.json` | Installed extension list | Selectable per-extension — see below |
-| `zen-themes.json` | Mods/themes configuration | |
-| `zen-keyboard-shortcuts.json` | Keyboard shortcuts | |
-| `zen-sessions.jsonlz4` | Workspace names, tab assignments | |
-| `zen-live-folders.jsonlz4` | Live folders | |
-| `chrome/zen-themes.css` | Compiled mod styles | |
-| `containers.json` | Workspace icons/colors | |
+Zen's Mozilla account sync covers spaces, containers, bookmarks, history,
+passwords, installed extensions and `storage.sync`. Zen Sync only backs up
+what it misses. A snapshot is an encrypted zip with a `manifest.json`:
 
-### prefs.js — per-machine keys excluded
+| Data | Source | Notes |
+|------|--------|-------|
+| Sine mods | `chrome/sine-mods/` | Mirrored on restore. Sine's generated `chrome.css` / `content.css` are skipped; Sine rebuilds them on startup |
+| Mod settings | `prefs.js` | Only prefs declared as `property` in a mod's `preferences.json` or Sine's `chrome/JS/core/settings.json`; settings missing from the snapshot are reset to default |
+| Extension storage | `storage/default/moz-extension+++<uuid>^userContextId=4294967295/` | `storage.local`; see below |
+| Extension permissions | `extension-preferences.json` | This extension's entry only |
+| Extension shortcuts | `extension-settings.json` → `commands` | This extension's entries only; the local install date is kept |
 
-The following preference key prefixes are **stripped before upload** and
-**re-injected from the local device after restore**, so they are never
-overwritten:
+No other `prefs.js` line is read or written, so the Mozilla account binding and
+device name are never touched. Prefs such as `services.sync.*`, `identity.*`
+and `app.update.*` are protected even if a mod declares them.
 
-- `services.sync.*` — Firefox Sync account binding and device name
-- `identity.fxaccounts.*` — Firefox Accounts identity
-- `identity.sync.*` — Sync server settings
-- `app.update.*`, `zen.updates.*` — Per-device update state
-- `toolkit.telemetry.cachedClientID` — Telemetry ID
-- `browser.sessionstore.*` — Machine-specific session restore state
-- `browser.startup.homepage_override.*` — Build-specific migration markers
+### Extension storage and UUIDs
 
-### extensions.json — per-extension selection
+Firefox gives each extension a random UUID per profile
+(`extensions.webextensions.uuids`). The UUID is part of the storage folder name
+and is also stored inside the folder's `.metadata-v2` file and the IndexedDB
+`database.origin` column. On restore, Zen Sync:
 
-In **Settings → Extensions to sync** you can toggle individual extensions
-on or off.  The default (nothing explicitly selected) means **all** user
-extensions are included.
+- uses the UUID the extension already has on this device, rewriting both
+  places, or adds the snapshot's UUID to the map if the extension isn't
+  installed yet
+- sets `extensions.webextensions.ExtensionStorageIDB.migrated.<id>`
+- marks the QuotaManager cache in `storage.sqlite` invalid so Zen rescans the
+  storage folders on next start
 
-When backing up, only the selected extension entries are written into the
-encrypted bundle.  When restoring, only the selected extensions are merged
-into the local `extensions.json` — all other extensions on the target device
-are left untouched.
+### Per-extension selection
 
-Extension storage data (the per-extension databases in `storage/`) is **not**
-synced.  Extensions must re-sync their own data through their own mechanisms
-(e.g. uBlock Origin's cloud backup, Bitwarden's vault sync).
+In **Settings → Extensions to back up** you can toggle individual extensions.
+Extensions are included by default, except password managers (Bitwarden,
+1Password, LastPass, KeePassXC, or anything named like one): their local
+storage holds account and device session state that shouldn't move between
+machines. Only choices that differ from the default are saved.
+
+### Safety copies
+
+Before a restore, every file and folder it will replace is copied to
+`%APPDATA%\app.zen.zensync\restore-backups\<timestamp>\`. The last three copies
+are kept.
 
 ---
 
@@ -212,10 +225,10 @@ synced.  Extensions must re-sync their own data through their own mechanisms
 | Issue in Zync | Fix in Zen Sync |
 |---|---|
 | Browser stuck in weird state after restore | Hard block: refuses all operations while Zen is running |
-| Device name overwritten on restore | `prefs.js` key filtering preserves `services.sync.client.name` and all other per-machine keys |
+| Device name overwritten on restore | Only mod settings are written to `prefs.js`; account and device prefs are never touched |
 | Auto-sync happening without user action | No background daemons — 100% manual trigger |
 | Autostart enabled by default | Off by default; toggle in tray or Settings |
-| All extensions always synced | Per-extension toggle in Settings → Extensions to sync |
+| All extensions always synced | Per-extension toggle in Settings → Extensions to back up |
 
 ---
 

@@ -14,6 +14,8 @@ export default function UpdateBanner({ info, onDismiss }: Props) {
     setInstalling(true);
     try {
       await bridge.installUpdate();
+      // Installed builds restart; portable builds only opened the download page.
+      if (info.portable) setInstalling(false);
     } catch (e) {
       console.error("Install update failed:", e);
       setInstalling(false);
@@ -36,7 +38,9 @@ export default function UpdateBanner({ info, onDismiss }: Props) {
           className="px-3 py-1 bg-accent text-white rounded-lg text-xs font-medium
                      hover:bg-accent-hover disabled:opacity-50 transition-colors"
         >
-          {installing ? "Installing…" : "Install"}
+          {info.portable
+            ? installing ? "Opening…" : "Download"
+            : installing ? "Installing…" : "Install"}
         </button>
         <button
           type="button"

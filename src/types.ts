@@ -19,6 +19,8 @@ export interface AppStatus {
 export interface UpdateInfo {
   version: string;
   notes: string;
+  /** Portable builds open the download page instead of installing. */
+  portable: boolean;
 }
 
 export interface ExtensionWithSelection {

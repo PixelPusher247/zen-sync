@@ -58,3 +58,5 @@ tempfile = "3"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+# Standalone exe without installer: updates link to the download page instead of self-installing
+portable = []

@@ -75,6 +75,7 @@ Download the latest Windows installer from the [Releases](https://github.com/Pix
 |--------|-------|
 | `.exe` (NSIS) | Recommended — standard Windows installer |
 | `.msi` | For enterprise / group policy deployments |
+| `_x64-portable.exe` | No installer — just run it. Needs the WebView2 runtime (built into Windows 11). Updates are downloaded manually from the in-app banner. Settings and the GitHub connection are shared with an installed copy. |
 
 > Windows may show a SmartScreen prompt on first run for unsigned builds. Click **More info → Run anyway** to proceed.
 

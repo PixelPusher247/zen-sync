@@ -59,3 +59,19 @@ jobs:
       - name: Upload latest.json for updater
         # tauri-action uploads this automatically when createUpdaterArtifacts is true
         run: echo "latest.json uploaded by tauri-action"
+
+      - name: Build portable exe
+        env:
+          GITHUB_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+          GITHUB_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
+        shell: pwsh
+        run: ./scripts/build-portable.ps1 -Target x86_64-pc-windows-msvc
+
+      - name: Upload portable exe
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          $exe = Get-ChildItem src-tauri/target/x86_64-pc-windows-msvc/release/bundle/portable/*-portable.exe
+          gh release upload $env:TAG $exe.FullName --clobber --repo "${{ github.repository }}"
