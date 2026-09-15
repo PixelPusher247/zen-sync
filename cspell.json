@@ -37,7 +37,10 @@
     "ntfy",
     "Litterbox",
     "catbox",
-    "PixelPusher"
+    "PixelPusher",
+    "frameless",
+    "DWMWA",
+    "DWMWCP"
   ],
   "ignorePaths": [
     "node_modules",

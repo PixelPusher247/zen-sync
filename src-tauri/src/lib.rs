@@ -105,6 +105,8 @@ pub fn run() {
 
             let window = app.get_webview_window("main")
                 .ok_or("main window not found")?;
+            #[cfg(windows)]
+            round_corners(&window);
 
             // Show window on first run (no GitHub token yet)
             if !github::has_stored_token() {
@@ -172,6 +174,28 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running zen-sync");
+}
+
+/// Frameless windows get square corners by default. Windows 11 rounds them on
+/// request; older versions reject the attribute and stay square.
+#[cfg(windows)]
+fn round_corners(window: &tauri::WebviewWindow) {
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    };
+    let Ok(hwnd) = window.hwnd() else { return };
+    // SAFETY: `hwnd` is our live window and the value matches the attribute's size.
+    let result = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &DWMWCP_ROUND as *const _ as *const std::ffi::c_void,
+            std::mem::size_of_val(&DWMWCP_ROUND) as u32,
+        )
+    };
+    if let Err(e) = result {
+        crate::zslog!("[app] rounded corners unavailable: {e}");
+    }
 }
 
 // ── Update handling ───────────────────────────────────────────────────────────

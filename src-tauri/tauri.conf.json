@@ -17,10 +17,11 @@
         "width": 400,
         "height": 620,
         "resizable": false,
+        "maximizable": false,
         "fullscreen": false,
         "center": true,
         "visible": false,
-        "decorations": true,
+        "decorations": false,
         "transparent": false
       }
     ],

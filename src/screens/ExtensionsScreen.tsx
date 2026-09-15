@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import { bridge } from "../bridge";
 import { formatBytes } from "../format";
 import type { ExtensionWithSelection } from "../types";
+import { CloseButton } from "../components/WindowControls";
 
 interface Props {
   onBack: () => void;
@@ -71,7 +72,10 @@ export default function ExtensionsScreen({ onBack }: Props) {
   return (
     <div className="flex flex-col h-full animate-fade-in">
       {/* Header */}
-      <div className="flex items-center gap-3 px-5 py-3.5 border-b border-surface-border bg-surface-raised">
+      <div
+        data-tauri-drag-region="deep"
+        className="flex items-center gap-3 pl-5 pr-3 py-3.5 border-b border-surface-border bg-surface-raised"
+      >
         <button
           type="button"
           onClick={onBack}
@@ -106,6 +110,7 @@ export default function ExtensionsScreen({ onBack }: Props) {
             </button>
           </div>
         )}
+        <CloseButton />
       </div>
 
       {/* Content */}

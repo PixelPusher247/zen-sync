@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { bridge } from "../bridge";
 import type { AppStatus } from "../types";
+import { FloatingTitleBar } from "../components/WindowControls";
 
 interface Props {
   onConnected: (status: AppStatus) => void;
@@ -23,7 +24,8 @@ export default function SetupScreen({ onConnected }: Props) {
   }
 
   return (
-    <div className="h-full flex flex-col items-center justify-center p-8 bg-surface animate-fade-in">
+    <div className="relative h-full flex flex-col items-center justify-center p-8 bg-surface animate-fade-in">
+      <FloatingTitleBar />
       <div className="w-full max-w-xs flex flex-col items-center gap-6">
         {/* Logo */}
         <div className="flex flex-col items-center gap-3">

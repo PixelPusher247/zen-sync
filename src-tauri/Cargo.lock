@@ -6267,7 +6267,7 @@ dependencies = [
 
 [[package]]
 name = "zen-sync"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -6292,6 +6292,7 @@ dependencies = [
  "tauri-plugin-updater",
  "tempfile",
  "tokio",
+ "windows 0.61.3",
  "zip 8.6.0",
 ]
 
