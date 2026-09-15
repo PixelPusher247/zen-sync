@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::bundle::SyncOptions;
+
 const STATE_FILE: &str = "state.json";
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -14,6 +16,8 @@ pub struct LocalState {
     /// (included, unless it's a password manager). Keyed by extension ID.
     #[serde(default)]
     pub extension_overrides: BTreeMap<String, bool>,
+    #[serde(default)]
+    pub sync_options: SyncOptions,
 }
 
 impl Default for LocalState {
@@ -24,6 +28,7 @@ impl Default for LocalState {
             snapshot_count: 3,
             autostart_enabled: false,
             extension_overrides: BTreeMap::new(),
+            sync_options: SyncOptions::default(),
         }
     }
 }
@@ -80,6 +85,10 @@ mod tests {
                 ("ext-a@test".to_string(), false),
                 ("ext-b@test".to_string(), true),
             ]),
+            sync_options: SyncOptions {
+                sine_mods: false,
+                ..SyncOptions::default()
+            },
         };
         orig.save(dir.path()).unwrap();
         let loaded = LocalState::load(dir.path());
@@ -95,5 +104,16 @@ mod tests {
         let s = LocalState::load(dir.path());
         assert_eq!(s.machine_name, "PC");
         assert!(s.extension_overrides.is_empty());
+        assert_eq!(s.sync_options, SyncOptions::default());
+    }
+
+    #[test]
+    fn sync_options_missing_from_state_default_to_on() {
+        let dir = tempdir().unwrap();
+        let json = r#"{"machine_name":"PC","snapshot_count":3,"autostart_enabled":false,"sync_options":{"sineMods":false}}"#;
+        std::fs::write(dir.path().join("state.json"), json).unwrap();
+        let s = LocalState::load(dir.path());
+        assert!(!s.sync_options.sine_mods);
+        assert!(s.sync_options.extension_shortcuts);
     }
 }

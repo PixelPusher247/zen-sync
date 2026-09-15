@@ -83,10 +83,11 @@ export default function App() {
           <DashboardScreen
             status={status}
             onStatusChange={setStatus}
+            onNavigate={setScreen}
           />
         )}
         {screen === "snapshots" && (
-          <SnapshotsScreen onStatusChange={setStatus} />
+          <SnapshotsScreen status={status} onStatusChange={setStatus} />
         )}
         {screen === "settings" && (
           <SettingsScreen

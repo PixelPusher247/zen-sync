@@ -33,9 +33,9 @@ Unlike [Zync](https://github.com/PixelPusher247/zync), there are no background d
                      on restore
 ```
 
-1. **Backup** — Click "Backup Now". Zen Sync zips your Sine mods, the values of the settings those mods declare, and the data of your selected extensions, encrypts the archive with AES-256-GCM, and uploads it as a release asset to a private `zen-sync-backup` repo in your GitHub account.
-2. **Restore** — Open the History screen, pick any snapshot from any device, and click Restore. Your mods folder is replaced with the snapshot's, mod settings are written into `prefs.js` one by one, and extension storage is copied in. Extension storage is tied to a per-profile UUID, so Zen Sync rewrites it to match the UUID the extension has on this device. Nothing else in `prefs.js` is touched, so device name and Mozilla account stay as they are.
-3. **Zen must be closed** — All operations are hard-blocked if Zen Browser is running, preventing database corruption and conflicting writes to files the browser holds open.
+1. **Backup** — Click "Back up now". Zen Sync zips your Sine mods, the values of the settings those mods declare, and the data of your selected extensions, encrypts the archive with AES-256-GCM, and uploads it as a release asset to a private `zen-sync-backup` repo in your GitHub account.
+2. **Restore** — Click "Restore latest backup" to restore the newest snapshot from any device, or open the History screen to pick an older one. Your mods folder is replaced with the snapshot's, mod settings are written into `prefs.js` one by one, and extension storage is copied in. Extension storage is tied to a per-profile UUID, so Zen Sync rewrites it to match the UUID the extension has on this device. Nothing else in `prefs.js` is touched, so device name and Mozilla account stay as they are.
+3. **Zen must be closed** — All operations are hard-blocked if Zen Browser is running, preventing database corruption and conflicting writes to files the browser holds open. The app notices within a couple of seconds when you close or open Zen.
 
 ---
 
@@ -45,6 +45,7 @@ Unlike [Zync](https://github.com/PixelPusher247/zync), there are no background d
 - **AES-256-GCM encryption** with PBKDF2-HMAC-SHA256 key derivation (100 k rounds); GitHub never sees plaintext data
 - **Encryption key in OS keychain** — stored in Windows Credential Manager, never on disk
 - **Works alongside Mozilla sync** — only data native sync doesn't cover is backed up; device identity and sync-account prefs are never read or written
+- **Choose what to sync** — turn Sine mods, mod settings, extension data, permissions and shortcuts on or off per device; the choice applies to both backups and restores on that device
 - **Per-extension selection** — choose which extensions' data to include; password managers are excluded by default because their local storage holds your account session
 - **Snapshot history** — keeps the last N snapshots per device (default 3, configurable 1–10); restore any of them from the History screen
 - **Cross-device restore** — snapshots from all your devices appear in the History screen; you can restore any device's backup onto any other device
@@ -88,6 +89,7 @@ Download the latest Windows installer from the [Releases](https://github.com/Pix
 - The backup repository is **private** and owned by your GitHub account
 - Before every restore, the files it will replace are copied to `%APPDATA%\app.zen.zensync\restore-backups\{timestamp}\` (the last 3 are kept), giving you a manual rollback path independent of the GitHub history
 - Upgrading from 0.1.x: the first backup deletes the old full-profile snapshots from GitHub after asking for confirmation
+- Snapshots now use a newer format that can leave out mods or mod settings. zen-sync 0.2.x refuses to restore them and asks you to update, rather than wiping the mods they don't contain
 
 ---
 

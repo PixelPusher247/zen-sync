@@ -5,6 +5,7 @@ import type {
   ExtensionWithSelection,
   RestoreReport,
   SnapshotInfo,
+  SyncOptions,
 } from "./types";
 
 export const bridge = {
@@ -22,6 +23,7 @@ export const bridge = {
 
   getBackupSummary: () => invoke<BackupSummary>("get_backup_summary_cmd"),
 
+  /** All devices' snapshots, newest first. */
   getSnapshots: () => invoke<SnapshotInfo[]>("get_snapshots_cmd"),
 
   restoreSnapshot: (index: number, machineId: string) =>
@@ -32,6 +34,9 @@ export const bridge = {
 
   setSnapshotCount: (count: number) =>
     invoke<void>("set_snapshot_count_cmd", { count }),
+
+  setSyncOptions: (options: SyncOptions) =>
+    invoke<void>("set_sync_options_cmd", { options }),
 
   setAutostart: (enabled: boolean) =>
     invoke<void>("set_autostart_cmd", { enabled }),

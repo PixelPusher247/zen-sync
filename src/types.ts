@@ -14,6 +14,16 @@ export interface AppStatus {
   lastBackupAt: string | null;
   snapshotCount: number;
   autostartEnabled: boolean;
+  syncOptions: SyncOptions;
+}
+
+/** What this device backs up and restores. */
+export interface SyncOptions {
+  sineMods: boolean;
+  modSettings: boolean;
+  extensionStorage: boolean;
+  extensionPermissions: boolean;
+  extensionShortcuts: boolean;
 }
 
 export interface UpdateInfo {

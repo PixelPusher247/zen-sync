@@ -25,6 +25,13 @@ struct AppState {
 }
 
 impl AppState {
+    fn selection(&self) -> bundle::Selection {
+        bundle::Selection {
+            options: self.local_state.sync_options.clone(),
+            extension_overrides: self.local_state.extension_overrides.clone(),
+        }
+    }
+
     fn machine_id(&self) -> String {
         // Stable identifier derived from machine name (URL-safe, lowercase)
         self.local_state
@@ -155,6 +162,7 @@ pub fn run() {
             restore_snapshot_cmd,
             set_machine_name_cmd,
             set_snapshot_count_cmd,
+            set_sync_options_cmd,
             set_autostart_cmd,
             get_extensions_with_selection_cmd,
             set_extension_selection_cmd,
@@ -234,6 +242,7 @@ struct AppStatusPayload {
     last_backup_at: Option<String>,
     snapshot_count: u8,
     autostart_enabled: bool,
+    sync_options: bundle::SyncOptions,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -265,6 +274,7 @@ fn get_status_cmd(
         last_backup_at: s.local_state.last_backup_at.clone(),
         snapshot_count: s.local_state.snapshot_count,
         autostart_enabled,
+        sync_options: s.local_state.sync_options.clone(),
     }
 }
 
@@ -296,13 +306,13 @@ async fn backup_now_cmd(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<(), String> {
-    if zen_check::is_zen_running() {
+    if zen_check::is_running() {
         return Err(
             "Zen Browser is open. Close it completely before backing up.".into(),
         );
     }
 
-    let (client, machine_name, machine_id, max_snapshots, overrides, config_dir) = {
+    let (client, machine_name, machine_id, max_snapshots, selection, config_dir) = {
         let s = state.lock().unwrap();
         let c = s.github_client.clone().ok_or("Not connected to GitHub")?;
         (
@@ -310,7 +320,7 @@ async fn backup_now_cmd(
             s.local_state.machine_name.clone(),
             s.machine_id(),
             s.local_state.snapshot_count,
-            s.local_state.extension_overrides.clone(),
+            s.selection(),
             s.config_dir.clone(),
         )
     };
@@ -321,7 +331,7 @@ async fn backup_now_cmd(
         &machine_name,
         &machine_id,
         max_snapshots,
-        overrides,
+        selection,
         delete_legacy,
         move |msg| {
             let _ = app_p.emit("sync-progress", msg);
@@ -371,10 +381,9 @@ async fn get_snapshots_cmd(
         s.github_client.clone().ok_or("Not connected to GitHub")?
     };
 
-    let metadata = client
-        .read_metadata()
-        .await?
-        .ok_or("No backup data found yet. Back up from any device first.")?;
+    let Some(metadata) = client.read_metadata().await? else {
+        return Ok(Vec::new());
+    };
 
     // Collect all snapshots from all machines, newest first across machines.
     let mut infos: Vec<SnapshotInfoPayload> = metadata
@@ -406,24 +415,20 @@ async fn restore_snapshot_cmd(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<bundle::RestoreReport, String> {
-    if zen_check::is_zen_running() {
+    if zen_check::is_running() {
         return Err(
             "Zen Browser is open. Close it completely before restoring.".into(),
         );
     }
 
-    let (client, overrides, safety_root) = {
+    let (client, selection, safety_root) = {
         let s = state.lock().unwrap();
         let c = s.github_client.clone().ok_or("Not connected to GitHub")?;
-        (
-            c,
-            s.local_state.extension_overrides.clone(),
-            s.config_dir.join("restore-backups"),
-        )
+        (c, s.selection(), s.config_dir.join("restore-backups"))
     };
 
     let app_p = app.clone();
-    let report = sync::restore(&client, &machine_id, index, overrides, safety_root, move |msg| {
+    let report = sync::restore(&client, &machine_id, index, selection, safety_root, move |msg| {
         let _ = app_p.emit("sync-progress", msg);
     })
     .await?;
@@ -450,6 +455,17 @@ fn set_snapshot_count_cmd(
 ) -> Result<(), String> {
     let mut s = state.lock().unwrap();
     s.local_state.snapshot_count = count.clamp(1, 10);
+    let config_dir = s.config_dir.clone();
+    s.local_state.save(&config_dir)
+}
+
+#[tauri::command]
+fn set_sync_options_cmd(
+    options: bundle::SyncOptions,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let mut s = state.lock().unwrap();
+    s.local_state.sync_options = options;
     let config_dir = s.config_dir.clone();
     s.local_state.save(&config_dir)
 }

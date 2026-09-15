@@ -1,8 +1,12 @@
-//! Snapshot bundle, format 2: a zip archive of Sine mods, mod setting values
+//! Snapshot bundle, format 3: a zip archive of Sine mods, mod setting values
 //! and per-extension data, described by `manifest.json`.
 //!
 //! Everything else in the profile (spaces, containers, bookmarks,
 //! `storage.sync`, ...) is left to Zen's built-in Mozilla account sync.
+//!
+//! Format 3 can leave out mod files or mod settings. Format 2 always had both,
+//! and zen-sync 0.2.x would wipe the mods folder restoring a snapshot without
+//! them, so the version was bumped to make those builds refuse it instead.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,10 +18,49 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::{ext_storage, extensions, fsutil, prefs, sine};
 
-pub const FORMAT_VERSION: u8 = 2;
+pub const FORMAT_VERSION: u8 = 3;
+/// Oldest format that can still be restored.
+const MIN_FORMAT_VERSION: u8 = 2;
 const MANIFEST_NAME: &str = "manifest.json";
 const MODS_PREFIX: &str = "sine/mods/";
 const PREFS_FILE: &str = "prefs.js";
+
+/// Which kinds of data this device puts into backups and takes from restores.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SyncOptions {
+    pub sine_mods: bool,
+    pub mod_settings: bool,
+    pub extension_storage: bool,
+    pub extension_permissions: bool,
+    pub extension_shortcuts: bool,
+}
+
+impl Default for SyncOptions {
+    fn default() -> Self {
+        Self {
+            sine_mods: true,
+            mod_settings: true,
+            extension_storage: true,
+            extension_permissions: true,
+            extension_shortcuts: true,
+        }
+    }
+}
+
+impl SyncOptions {
+    fn any_extension_data(&self) -> bool {
+        self.extension_storage || self.extension_permissions || self.extension_shortcuts
+    }
+}
+
+/// Everything this device's settings say a backup includes and a restore applies.
+#[derive(Clone, Debug, Default)]
+pub struct Selection {
+    pub options: SyncOptions,
+    /// Per-extension choices, see [`extensions::is_selected`].
+    pub extension_overrides: BTreeMap<String, bool>,
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Manifest {
@@ -31,9 +74,20 @@ pub struct Manifest {
 pub struct SineSection {
     pub engine_version: Option<String>,
     pub mod_count: usize,
+    /// Whether the mod files are under `sine/mods/`. Always true in format 2.
+    #[serde(default = "default_true")]
+    pub mods_included: bool,
     /// Declared mod and Sine settings → raw prefs.js value literal.
-    /// Settings at their default have no entry.
-    pub prefs: BTreeMap<String, String>,
+    /// Settings at their default have no entry. None if settings were left out.
+    pub prefs: Option<BTreeMap<String, String>>,
+    /// Every setting declared on the source device, so a restore only resets
+    /// settings the source knew about. Missing in format 2.
+    #[serde(default)]
+    pub declared_prefs: Option<BTreeSet<String>>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -121,30 +175,42 @@ pub fn summarize(profile_dir: &Path, overrides: &BTreeMap<String, bool>) -> Back
 // ── Backup ────────────────────────────────────────────────────────────────────
 
 /// Build a snapshot archive from the profile. Zen must be closed.
-pub fn build(
-    profile_dir: &Path,
-    overrides: &BTreeMap<String, bool>,
-) -> Result<(Vec<u8>, Manifest), String> {
+pub fn build(profile_dir: &Path, selection: &Selection) -> Result<(Vec<u8>, Manifest), String> {
+    let Selection { options, extension_overrides: overrides } = selection;
+    if !options.sine_mods && !options.mod_settings && !options.any_extension_data() {
+        return Err("Nothing is selected to back up. Choose what to sync in Settings.".into());
+    }
     let prefs_content = read_prefs(profile_dir);
     let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
 
-    let sine = if sine::has_mods(profile_dir) {
-        for entry in sine::mod_files(profile_dir) {
-            add_entry(&mut zip, &format!("{MODS_PREFIX}{}", entry.rel), &entry)?;
+    let sine = if !sine::has_mods(profile_dir) {
+        crate::zslog!("[bundle] no Sine mods in profile");
+        None
+    } else if options.sine_mods || options.mod_settings {
+        if options.sine_mods {
+            for entry in sine::mod_files(profile_dir) {
+                add_entry(&mut zip, &format!("{MODS_PREFIX}{}", entry.rel), &entry)?;
+            }
         }
+        let declared = sine::declared_prefs(profile_dir);
         let section = SineSection {
             engine_version: sine::engine_version(profile_dir),
             mod_count: sine::mod_count(profile_dir),
-            prefs: prefs::read_values(&prefs_content, &sine::declared_prefs(profile_dir)),
+            mods_included: options.sine_mods,
+            prefs: options
+                .mod_settings
+                .then(|| prefs::read_values(&prefs_content, &declared)),
+            declared_prefs: options.mod_settings.then_some(declared),
         };
         crate::zslog!(
-            "[bundle] sine: {} mods, {} settings",
+            "[bundle] sine: {} mods (files: {}), settings: {:?}",
             section.mod_count,
-            section.prefs.len()
+            section.mods_included,
+            section.prefs.as_ref().map(BTreeMap::len)
         );
         Some(section)
     } else {
-        crate::zslog!("[bundle] no Sine mods in profile");
+        crate::zslog!("[bundle] Sine mods and settings turned off");
         None
     };
 
@@ -152,17 +218,29 @@ pub fn build(
         crate::zslog!("[bundle] {e}; extension storage skipped");
         BTreeMap::new()
     });
-    let permissions = ext_storage::read_json(&profile_dir.join(ext_storage::PERMISSIONS_FILE));
-    let settings = ext_storage::read_json(&profile_dir.join(ext_storage::SETTINGS_FILE));
+    let permissions = options
+        .extension_permissions
+        .then(|| ext_storage::read_json(&profile_dir.join(ext_storage::PERMISSIONS_FILE)))
+        .flatten();
+    let settings = options
+        .extension_shortcuts
+        .then(|| ext_storage::read_json(&profile_dir.join(ext_storage::SETTINGS_FILE)))
+        .flatten();
 
+    let installed = if options.any_extension_data() {
+        extensions::list_extensions(profile_dir)?
+    } else {
+        Vec::new()
+    };
     let mut extension_sections: Vec<ExtensionSection> = Vec::new();
-    for ext in extensions::list_extensions(profile_dir)? {
+    for ext in installed {
         if !extensions::is_selected(overrides, &ext.id, &ext.name) {
             continue;
         }
         let uuid = uuids.get(&ext.id).cloned();
         let storage_dir = uuid
             .as_deref()
+            .filter(|_| options.extension_storage)
             .map(|u| ext_storage::storage_local_dir(profile_dir, u))
             .filter(|d| d.is_dir());
         let ext_permissions = permissions.as_ref().and_then(|p| p.get(&ext.id)).cloned();
@@ -263,9 +341,10 @@ fn add_entry(
 pub fn apply(
     profile_dir: &Path,
     archive_bytes: &[u8],
-    overrides: &BTreeMap<String, bool>,
+    selection: &Selection,
     safety_dir: &Path,
 ) -> Result<RestoreReport, String> {
+    let Selection { options, extension_overrides: overrides } = selection;
     let mut archive = ZipArchive::new(Cursor::new(archive_bytes))
         .map_err(|e| format!("Snapshot is not a valid archive: {e}"))?;
     let manifest = read_manifest(&mut archive)?;
@@ -276,15 +355,34 @@ pub fn apply(
     let mut set_prefs: BTreeMap<String, String> = BTreeMap::new();
     let mut clear_prefs: BTreeSet<String> = BTreeSet::new();
 
-    let installed: BTreeSet<String> = extensions::list_extensions(profile_dir)?
-        .into_iter()
-        .map(|e| e.id)
-        .collect();
+    // What this device takes from the snapshot, given its own sync options.
+    let sine_mods = manifest
+        .sine
+        .as_ref()
+        .filter(|s| options.sine_mods && s.mods_included);
+    let sine_prefs = manifest
+        .sine
+        .as_ref()
+        .and_then(|s| s.prefs.as_ref())
+        .filter(|_| options.mod_settings);
+    let restores_storage = |e: &ExtensionSection| options.extension_storage && e.storage_prefix.is_some();
+    let restores_permissions = |e: &ExtensionSection| options.extension_permissions && e.permissions.is_some();
+    let restores_shortcuts = |e: &ExtensionSection| options.extension_shortcuts && !e.commands.is_empty();
+
     let selected: Vec<&ExtensionSection> = manifest
         .extensions
         .iter()
         .filter(|e| extensions::is_selected(overrides, &e.id, &e.name))
+        .filter(|e| restores_storage(e) || restores_permissions(e) || restores_shortcuts(e))
         .collect();
+    let installed: BTreeSet<String> = if selected.is_empty() {
+        BTreeSet::new()
+    } else {
+        extensions::list_extensions(profile_dir)?
+            .into_iter()
+            .map(|e| e.id)
+            .collect()
+    };
 
     // Resolve target UUIDs up front so the safety copy covers every folder we replace.
     let mut uuid_map = ext_storage::uuid_map(&prefs_content);
@@ -292,7 +390,7 @@ pub fn apply(
     let mut storage_targets: BTreeMap<&str, String> = BTreeMap::new();
     match uuid_map.as_mut() {
         Ok(map) => {
-            for ext in selected.iter().filter(|e| e.storage_prefix.is_some()) {
+            for ext in selected.iter().filter(|e| restores_storage(e)) {
                 let uuid = match map.get(&ext.id) {
                     Some(uuid) => uuid.clone(),
                     None => {
@@ -307,7 +405,7 @@ pub fn apply(
         }
         Err(e) => {
             crate::zslog!("[bundle] {e}");
-            if selected.iter().any(|e| e.storage_prefix.is_some()) {
+            if selected.iter().any(|e| restores_storage(e)) {
                 report.warnings.push(
                     "Couldn't read extension IDs from prefs.js, so extension storage was not restored."
                         .into(),
@@ -321,7 +419,7 @@ pub fn apply(
         ext_storage::PERMISSIONS_FILE.to_string(),
         ext_storage::SETTINGS_FILE.to_string(),
     ];
-    if manifest.sine.is_some() {
+    if sine_mods.is_some() {
         to_save.push("chrome/sine-mods".into());
     }
     to_save.extend(storage_targets.values().map(|uuid| ext_storage::storage_local_rel(uuid)));
@@ -334,7 +432,7 @@ pub fn apply(
     crate::zslog!("[bundle] safety copy at {}", safety_dir.display());
 
     // Sine mods: mirror the snapshot, then sync the declared settings.
-    if let Some(section) = &manifest.sine {
+    if let Some(section) = sine_mods {
         let dest = sine::mods_dir(profile_dir);
         replace_dir(&dest)?;
         extract_prefix(&mut archive, MODS_PREFIX, &dest)?;
@@ -346,22 +444,35 @@ pub fn apply(
                     .map_err(|e| format!("Failed to create {}: {e}", path.display()))?;
             }
         }
+        report.mod_count = section.mod_count;
+    }
 
-        for (name, value) in &section.prefs {
+    if let Some(values) = sine_prefs {
+        for (name, value) in values {
             if !prefs::is_protected(name) {
                 set_prefs.insert(name.clone(), value.clone());
             }
         }
-        clear_prefs.extend(
-            sine::declared_prefs(profile_dir)
-                .into_iter()
-                .filter(|name| !section.prefs.contains_key(name)),
-        );
-        report.mod_count = section.mod_count;
+        // A declared setting without a value is at its default on the source, so
+        // reset it here too, but only if the source declared it: settings of mods
+        // only this device has stay. Format 2 has no declared list; its mods, once
+        // restored, declare the same settings.
+        let source_declared = manifest.sine.as_ref().and_then(|s| s.declared_prefs.as_ref());
+        if source_declared.is_some() || sine_mods.is_some() {
+            clear_prefs.extend(sine::declared_prefs(profile_dir).into_iter().filter(|name| {
+                !values.contains_key(name) && source_declared.is_none_or(|d| d.contains(name))
+            }));
+        }
+    }
 
+    let sine_restored = manifest
+        .sine
+        .as_ref()
+        .filter(|_| sine_mods.is_some() || sine_prefs.is_some());
+    if let Some(section) = sine_restored {
         if !sine::engine_installed(profile_dir) {
             report.warnings.push(
-                "Sine isn't installed on this device. The mods were restored but won't load until you install Sine."
+                "Sine isn't installed on this device. The restored mods and settings won't load until you install Sine."
                     .into(),
             );
         } else if let (Some(local), Some(backup)) =
@@ -400,7 +511,7 @@ pub fn apply(
             storage_restored = true;
         }
 
-        if let (Some(entry), true) = (&ext.permissions, permissions_writable) {
+        if let (Some(entry), true) = (&ext.permissions, permissions_writable && restores_permissions(ext)) {
             let root = permissions.get_or_insert_with(|| serde_json::json!({}));
             if let Some(obj) = root.as_object_mut() {
                 obj.insert(ext.id.clone(), entry.clone());
@@ -408,7 +519,7 @@ pub fn apply(
             }
         }
 
-        if !ext.commands.is_empty() {
+        if restores_shortcuts(ext) {
             match settings.as_mut() {
                 Some(root) => {
                     ext_storage::merge_commands(root, &ext.id, &ext.commands);
@@ -466,7 +577,7 @@ fn read_manifest<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<Manifest
     let raw: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| format!("Snapshot manifest error: {e}"))?;
     let format = raw.get("format").and_then(|v| v.as_u64()).unwrap_or(0);
-    if format != u64::from(FORMAT_VERSION) {
+    if !(u64::from(MIN_FORMAT_VERSION)..=u64::from(FORMAT_VERSION)).contains(&format) {
         return Err(format!("Unsupported snapshot format {format}. Update zen-sync."));
     }
     serde_json::from_value(raw).map_err(|e| format!("Snapshot manifest error: {e}"))
@@ -640,9 +751,9 @@ mod tests {
         let source = tempdir().unwrap();
         source_profile(source.path());
 
-        let (bytes, manifest) = build(source.path(), &BTreeMap::new()).unwrap();
+        let (bytes, manifest) = build(source.path(), &Selection::default()).unwrap();
         let sine = manifest.sine.as_ref().unwrap();
-        assert_eq!(sine.prefs.len(), 1);
+        assert_eq!(sine.prefs.as_ref().unwrap().len(), 1);
         assert_eq!(manifest.extensions.len(), 1, "Bitwarden is excluded by default");
         assert_eq!(manifest.extensions[0].id, DARK_READER);
 
@@ -682,7 +793,7 @@ mod tests {
         }
 
         let safety = tempdir().unwrap();
-        let report = apply(t, &bytes, &BTreeMap::new(), safety.path()).unwrap();
+        let report = apply(t, &bytes, &Selection::default(),safety.path()).unwrap();
         assert_eq!(report.extension_count, 1);
         assert_eq!(report.mod_count, 1);
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
@@ -731,14 +842,16 @@ mod tests {
     fn restore_seeds_uuid_for_extension_not_installed_yet() {
         let source = tempdir().unwrap();
         source_profile(source.path());
-        let (bytes, _) = build(source.path(), &BTreeMap::new()).unwrap();
+        let (bytes, _) = build(source.path(), &Selection::default()).unwrap();
 
         let target = tempdir().unwrap();
         let t = target.path();
         write(t, "prefs.js", &format!("{}\n", uuids_line(&[(BITWARDEN, UUID_BW)])));
         write(t, "extensions.json", &extensions_json(&[]));
 
-        let report = apply(t, &bytes, &BTreeMap::new(), tempdir().unwrap().path()).unwrap();
+        let report =
+            apply(t, &bytes, &Selection::default(),tempdir().unwrap().path())
+                .unwrap();
         assert!(report.warnings.iter().any(|w| w.contains("Dark Reader isn't installed")));
         assert!(report.warnings.iter().any(|w| w.contains("Sine isn't installed")));
 
@@ -753,28 +866,175 @@ mod tests {
     fn deselected_extensions_are_not_restored() {
         let source = tempdir().unwrap();
         source_profile(source.path());
-        let (bytes, _) = build(source.path(), &BTreeMap::new()).unwrap();
+        let (bytes, _) = build(source.path(), &Selection::default()).unwrap();
 
         let target = tempdir().unwrap();
         let t = target.path();
         write(t, "prefs.js", "");
         write(t, "extensions.json", &extensions_json(&[(DARK_READER, "Dark Reader")]));
 
-        let mut overrides = BTreeMap::new();
-        overrides.insert(DARK_READER.to_string(), false);
-        let report = apply(t, &bytes, &overrides, tempdir().unwrap().path()).unwrap();
+        let selection = Selection {
+            extension_overrides: BTreeMap::from([(DARK_READER.to_string(), false)]),
+            ..Selection::default()
+        };
+        let report = apply(t, &bytes, &selection, tempdir().unwrap().path()).unwrap();
         assert_eq!(report.extension_count, 0);
         assert!(!t.join("storage").exists());
+    }
+
+    /// Target with Dark Reader under its own UUID, a mod the source also has and
+    /// one only the target has.
+    fn target_profile(t: &Path) {
+        write(
+            t,
+            "prefs.js",
+            &format!(
+                "user_pref(\"mod.lean.top-workspace\", true);\nuser_pref(\"mod.local.only\", 5);\n{}\n",
+                uuids_line(&[(DARK_READER, UUID_DST)])
+            ),
+        );
+        write(t, "chrome/JS/sine.sys.mjs", "");
+        write(t, "chrome/sine-mods/mods.json", r#"{"lean":{},"local":{}}"#);
+        write(
+            t,
+            "chrome/sine-mods/lean/preferences.json",
+            r#"[{"property":"mod.lean.hide-zoom"},{"property":"mod.lean.top-workspace"}]"#,
+        );
+        write(t, "chrome/sine-mods/local/preferences.json", r#"[{"property":"mod.local.only"}]"#);
+        write(t, "extensions.json", &extensions_json(&[(DARK_READER, "Dark Reader")]));
+        storage_folder(t, UUID_DST, "light");
+        write(t, ext_storage::PERMISSIONS_FILE, "{}");
+    }
+
+    fn archive_names(bytes: &[u8]) -> Vec<String> {
+        let archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        archive.file_names().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn backup_leaves_out_what_this_device_does_not_sync() {
+        let source = tempdir().unwrap();
+        source_profile(source.path());
+        let selection = Selection {
+            options: SyncOptions {
+                sine_mods: false,
+                extension_storage: false,
+                ..SyncOptions::default()
+            },
+            ..Selection::default()
+        };
+        let (bytes, manifest) = build(source.path(), &selection).unwrap();
+        assert!(!archive_names(&bytes).iter().any(|n| n.starts_with(MODS_PREFIX)));
+        let sine = manifest.sine.as_ref().unwrap();
+        assert!(!sine.mods_included);
+        assert!(sine.declared_prefs.as_ref().unwrap().contains("mod.lean.top-workspace"));
+        assert!(manifest.extensions[0].storage_prefix.is_none());
+
+        let target = tempdir().unwrap();
+        let t = target.path();
+        target_profile(t);
+        let report =
+            apply(t, &bytes, &Selection::default(),tempdir().unwrap().path())
+                .unwrap();
+        assert_eq!(report.mod_count, 0);
+        assert_eq!(report.extension_count, 1);
+
+        // Local mods and storage stay; settings follow the source.
+        assert!(t.join("chrome/sine-mods/local/preferences.json").is_file());
+        assert_eq!(origin_in_db(t, UUID_DST).1, "light");
+        let prefs_out = std::fs::read_to_string(t.join("prefs.js")).unwrap();
+        assert!(prefs_out.contains("user_pref(\"mod.lean.hide-zoom\", true);"));
+        assert!(!prefs_out.contains("mod.lean.top-workspace"));
+        assert!(prefs_out.contains("user_pref(\"mod.local.only\", 5);"));
+        let perms = ext_storage::read_json(&t.join(ext_storage::PERMISSIONS_FILE)).unwrap();
+        assert_eq!(perms[DARK_READER]["origins"][0], "<all_urls>");
+
+        let nothing = Selection {
+            options: SyncOptions {
+                sine_mods: false,
+                mod_settings: false,
+                extension_storage: false,
+                extension_permissions: false,
+                extension_shortcuts: false,
+            },
+            ..Selection::default()
+        };
+        let err = build(source.path(), &nothing).unwrap_err();
+        assert!(err.contains("Nothing is selected"));
+    }
+
+    #[test]
+    fn restore_skips_what_this_device_does_not_sync() {
+        let source = tempdir().unwrap();
+        source_profile(source.path());
+        let (bytes, _) = build(source.path(), &Selection::default()).unwrap();
+
+        let target = tempdir().unwrap();
+        let t = target.path();
+        target_profile(t);
+        let selection = Selection {
+            options: SyncOptions {
+                mod_settings: false,
+                extension_permissions: false,
+                ..SyncOptions::default()
+            },
+            ..Selection::default()
+        };
+        let report = apply(t, &bytes, &selection, tempdir().unwrap().path()).unwrap();
+        assert_eq!(report.mod_count, 1);
+
+        assert!(t.join("chrome/sine-mods/lean/chrome.css").is_file());
+        assert!(!t.join("chrome/sine-mods/local").exists());
+        let prefs_out = std::fs::read_to_string(t.join("prefs.js")).unwrap();
+        assert!(!prefs_out.contains("mod.lean.hide-zoom"));
+        assert!(prefs_out.contains("user_pref(\"mod.lean.top-workspace\", true);"));
+        assert_eq!(origin_in_db(t, UUID_DST).1, "dark");
+        assert_eq!(std::fs::read_to_string(t.join(ext_storage::PERMISSIONS_FILE)).unwrap(), "{}");
+    }
+
+    #[test]
+    fn restores_format_2_snapshots() {
+        let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+        let files = [
+            ("sine/mods/mods.json", r#"{"lean":{}}"#),
+            (
+                "sine/mods/lean/preferences.json",
+                r#"[{"property":"mod.lean.hide-zoom"},{"property":"mod.lean.top-workspace"}]"#,
+            ),
+            (
+                MANIFEST_NAME,
+                r#"{"format":2,"created_at":0,"extensions":[],
+                    "sine":{"engine_version":null,"mod_count":1,"prefs":{"mod.lean.hide-zoom":"true"}}}"#,
+            ),
+        ];
+        for (name, content) in files {
+            zip.start_file(name, file_options(CompressionMethod::Stored)).unwrap();
+            std::io::Write::write_all(&mut zip, content.as_bytes()).unwrap();
+        }
+        let bytes = zip.finish().unwrap().into_inner();
+
+        let target = tempdir().unwrap();
+        let t = target.path();
+        target_profile(t);
+        let report =
+            apply(t, &bytes, &Selection::default(),tempdir().unwrap().path())
+                .unwrap();
+        assert_eq!(report.mod_count, 1);
+        assert!(!t.join("chrome/sine-mods/local").exists());
+        let prefs_out = std::fs::read_to_string(t.join("prefs.js")).unwrap();
+        assert!(prefs_out.contains("user_pref(\"mod.lean.hide-zoom\", true);"));
+        assert!(!prefs_out.contains("mod.lean.top-workspace"));
     }
 
     #[test]
     fn rejects_other_formats() {
         let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
         zip.start_file(MANIFEST_NAME, file_options(CompressionMethod::Stored)).unwrap();
-        std::io::Write::write_all(&mut zip, br#"{"format":3}"#).unwrap();
+        std::io::Write::write_all(&mut zip, br#"{"format":4}"#).unwrap();
         let bytes = zip.finish().unwrap().into_inner();
         let dir = tempdir().unwrap();
-        let err = apply(dir.path(), &bytes, &BTreeMap::new(), dir.path()).unwrap_err();
-        assert!(err.contains("Unsupported snapshot format 3"));
+        let err = apply(dir.path(), &bytes, &Selection::default(),dir.path())
+            .unwrap_err();
+        assert!(err.contains("Unsupported snapshot format 4"));
     }
 }

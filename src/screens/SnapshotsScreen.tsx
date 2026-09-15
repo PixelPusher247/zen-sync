@@ -1,76 +1,31 @@
 import { useState, useEffect } from "react";
 import { bridge } from "../bridge";
-import type { AppStatus, RestoreReport, SnapshotInfo } from "../types";
+import { formatDate } from "../format";
+import type { AppStatus, SnapshotInfo } from "../types";
 import ZenRunningGuard from "../components/ZenRunningGuard";
+import RestoreResult from "../components/RestoreResult";
+import { useZenRunning } from "../hooks/useZenRunning";
+import { snapshotKey, useRestore } from "../hooks/useRestore";
 
 interface Props {
+  status: AppStatus;
   onStatusChange: (s: AppStatus) => void;
 }
 
-function formatDate(iso: string): string {
-  try {
-    const d = new Date(iso);
-    return d.toLocaleString(undefined, {
-      month: "short",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  } catch {
-    return iso;
-  }
-}
-
-export default function SnapshotsScreen({ onStatusChange }: Props) {
+export default function SnapshotsScreen({ status, onStatusChange }: Props) {
   const [snapshots, setSnapshots] = useState<SnapshotInfo[] | null>(null);
   const [loading, setLoading] = useState(true);
-  const [restoringKey, setRestoringKey] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [restored, setRestored] = useState<RestoreReport | null>(null);
-  const [zenRunning, setZenRunning] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const zenRunning = useZenRunning();
+  const restore = useRestore(status, onStatusChange);
 
   useEffect(() => {
-    Promise.all([
-      bridge.getSnapshots(),
-      bridge.isZenRunning(),
-    ])
-      .then(([snaps, zen]) => {
-        setSnapshots(snaps);
-        setZenRunning(zen);
-      })
-      .catch((e) => setError(String(e)))
+    bridge
+      .getSnapshots()
+      .then(setSnapshots)
+      .catch((e) => setLoadError(String(e)))
       .finally(() => setLoading(false));
   }, []);
-
-  async function handleRestore(index: number, machineId: string) {
-    if (zenRunning) return;
-    if (
-      !confirm(
-        "Restore this snapshot? Your Sine mods, mod settings and the selected " +
-          "extensions' data on this device will be replaced. The current files " +
-          "are saved locally first."
-      )
-    ) {
-      return;
-    }
-    const key = `${machineId}-${index}`;
-    setRestoringKey(key);
-    setError(null);
-    setRestored(null);
-    try {
-      const report = await bridge.restoreSnapshot(index, machineId);
-      const s = await bridge.getStatus();
-      onStatusChange(s);
-      setRestored(report);
-      if (report.warnings.length === 0) {
-        setTimeout(() => setRestored(null), 4000);
-      }
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setRestoringKey(null);
-    }
-  }
 
   if (loading) {
     return (
@@ -79,6 +34,8 @@ export default function SnapshotsScreen({ onStatusChange }: Props) {
       </div>
     );
   }
+
+  const error = restore.error ?? loadError;
 
   return (
     <div className="p-5 flex flex-col gap-4 animate-fade-in">
@@ -97,7 +54,10 @@ export default function SnapshotsScreen({ onStatusChange }: Props) {
           <p className="text-xs mt-1 opacity-80 whitespace-pre-line">{error}</p>
           <button
             type="button"
-            onClick={() => setError(null)}
+            onClick={() => {
+              restore.dismissError();
+              setLoadError(null);
+            }}
             className="mt-2 text-xs underline opacity-70 hover:opacity-100"
           >
             Dismiss
@@ -105,32 +65,8 @@ export default function SnapshotsScreen({ onStatusChange }: Props) {
         </div>
       )}
 
-      {restored !== null && (
-        <div className="flex flex-col gap-2 animate-fade-in">
-          <div className="flex items-center gap-2 p-3 bg-success/10 border border-success/20 rounded-xl text-sm text-success">
-            <span>✓</span>
-            <span>
-              Restored {restored.modCount} mod{restored.modCount === 1 ? "" : "s"} and{" "}
-              {restored.extensionCount} extension{restored.extensionCount === 1 ? "" : "s"}
-            </span>
-          </div>
-          {restored.warnings.length > 0 && (
-            <div className="p-3 bg-warning/10 border border-warning/20 rounded-xl text-xs text-warning">
-              <ul className="flex flex-col gap-1 list-disc pl-4">
-                {restored.warnings.map((w) => (
-                  <li key={w}>{w}</li>
-                ))}
-              </ul>
-              <button
-                type="button"
-                onClick={() => setRestored(null)}
-                className="mt-2 underline opacity-70 hover:opacity-100"
-              >
-                Dismiss
-              </button>
-            </div>
-          )}
-        </div>
+      {restore.report && (
+        <RestoreResult report={restore.report} onDismiss={restore.dismissReport} />
       )}
 
       {snapshots && snapshots.length === 0 && (
@@ -145,10 +81,10 @@ export default function SnapshotsScreen({ onStatusChange }: Props) {
       {snapshots && snapshots.length > 0 && (
         <div className="flex flex-col gap-2">
           {snapshots.map((snap) => {
-            const snapKey = `${snap.machineId}-${snap.index}`;
+            const key = snapshotKey(snap);
             return (
               <div
-                key={snapKey}
+                key={key}
                 className={`card p-3.5 flex items-center justify-between gap-3 transition-colors
                   ${snap.isCurrent ? "border-accent/30 bg-accent/5" : ""}`}
               >
@@ -169,11 +105,11 @@ export default function SnapshotsScreen({ onStatusChange }: Props) {
                 </div>
                 <button
                   type="button"
-                  onClick={() => handleRestore(snap.index, snap.machineId)}
-                  disabled={restoringKey !== null || zenRunning}
+                  onClick={() => restore.restore(snap)}
+                  disabled={restore.restoringKey !== null || zenRunning}
                   className="btn-secondary text-xs px-3 py-1.5 shrink-0"
                 >
-                  {restoringKey === snapKey ? (
+                  {restore.restoringKey === key ? (
                     <div className="w-3 h-3 border border-muted border-t-transparent rounded-full animate-spin" />
                   ) : (
                     "Restore"

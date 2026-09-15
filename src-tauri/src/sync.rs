@@ -1,7 +1,6 @@
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::bundle::{self, RestoreReport};
+use crate::bundle::{self, RestoreReport, Selection};
 use crate::github::{GitHubClient, MachineMetadata, SnapshotEntry, SyncMetadata};
 use crate::{crypto, profile};
 
@@ -49,7 +48,7 @@ pub async fn backup(
     machine_name: &str,
     machine_id: &str,
     max_snapshots: u8,
-    overrides: BTreeMap<String, bool>,
+    selection: Selection,
     delete_legacy: bool,
     on_progress: impl Fn(&str) + Send,
 ) -> Result<String, String> {
@@ -69,7 +68,7 @@ pub async fn backup(
 
     on_progress("Collecting mods and extension data…");
     let (archive, manifest) =
-        tokio::task::spawn_blocking(move || bundle::build(&profile_dir, &overrides))
+        tokio::task::spawn_blocking(move || bundle::build(&profile_dir, &selection))
             .await
             .map_err(|e| format!("Backup task failed: {e}"))??;
     crate::zslog!(
@@ -162,7 +161,7 @@ pub async fn restore(
     client: &GitHubClient,
     machine_id: &str,
     index: u8,
-    overrides: BTreeMap<String, bool>,
+    selection: Selection,
     safety_root: PathBuf,
     on_progress: impl Fn(&str) + Send,
 ) -> Result<RestoreReport, String> {
@@ -180,7 +179,7 @@ pub async fn restore(
     on_progress("Writing files…");
     let safety_dir = safety_root.join(now_epoch().to_string());
     let report = tokio::task::spawn_blocking(move || {
-        let result = bundle::apply(&profile_dir, &archive, &overrides, &safety_dir);
+        let result = bundle::apply(&profile_dir, &archive, &selection, &safety_dir);
         prune_safety_copies(&safety_root);
         result.map_err(|e| {
             if safety_dir.exists() {

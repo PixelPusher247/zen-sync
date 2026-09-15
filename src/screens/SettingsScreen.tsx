@@ -1,6 +1,9 @@
 import { useState, useEffect, useRef } from "react";
 import { bridge } from "../bridge";
-import type { AppStatus, Screen } from "../types";
+import { hasExtensionData } from "../format";
+import type { AppStatus, Screen, SyncOptions } from "../types";
+import { useConfirm } from "../components/ConfirmDialog";
+import Switch from "../components/Switch";
 
 interface Props {
   status: AppStatus;
@@ -8,7 +11,17 @@ interface Props {
   onNavigate: (s: Screen) => void;
 }
 
+const SYNC_ITEMS: { key: keyof SyncOptions; label: string; description: string }[] = [
+  { key: "sineMods", label: "Sine mods", description: "Installed mods and their files" },
+  { key: "modSettings", label: "Mod settings", description: "Values you set for mods and Sine" },
+  { key: "extensionStorage", label: "Extension data", description: "What extensions keep in local storage" },
+  { key: "extensionPermissions", label: "Extension permissions", description: "Optional permissions you granted" },
+  { key: "extensionShortcuts", label: "Extension shortcuts", description: "Custom keyboard shortcuts" },
+];
+
 export default function SettingsScreen({ status, onStatusChange, onNavigate }: Props) {
+  const confirm = useConfirm();
+  const [syncOptions, setSyncOptions] = useState(status.syncOptions);
   const [machineName, setMachineName] = useState(status.machineName);
   const [snapshotCount, setSnapshotCount] = useState(status.snapshotCount);
   const [autostart, setAutostart] = useState(status.autostartEnabled);
@@ -46,6 +59,19 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
     }
   }
 
+  async function handleSyncOptionChange(key: keyof SyncOptions, value: boolean) {
+    const previous = syncOptions;
+    const next = { ...previous, [key]: value };
+    setSyncOptions(next);
+    try {
+      await bridge.setSyncOptions(next);
+      onStatusChange(await bridge.getStatus());
+    } catch (e) {
+      setSyncOptions(previous);
+      setError(String(e));
+    }
+  }
+
   async function handleAutostartToggle() {
     const next = !autostart;
     setAutostart(next);
@@ -60,9 +86,13 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
   }
 
   async function handleDisconnect() {
-    if (!confirm("Disconnect from GitHub? Your backup repo will not be deleted.")) {
-      return;
-    }
+    const ok = await confirm({
+      title: "Disconnect from GitHub?",
+      message: "Your backup repo and its snapshots are not deleted. You can reconnect at any time.",
+      confirmLabel: "Disconnect",
+      danger: true,
+    });
+    if (!ok) return;
     setDisconnecting(true);
     try {
       await bridge.disconnectGithub();
@@ -141,14 +171,35 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
             Older snapshots are automatically removed.
           </p>
         </div>
+      </div>
+
+      {/* What to sync */}
+      <div className="card p-4 flex flex-col gap-3">
+        <div>
+          <p className="section-label mb-0.5">What to sync</p>
+          <p className="text-xs text-muted">
+            Applies to backups and restores on this device.
+          </p>
+        </div>
+        {SYNC_ITEMS.map((item) => (
+          <Switch
+            key={item.key}
+            label={item.label}
+            description={item.description}
+            checked={syncOptions[item.key]}
+            onChange={(value) => handleSyncOptionChange(item.key, value)}
+          />
+        ))}
         <div className="divider" />
         <button
           type="button"
           onClick={() => onNavigate("extensions")}
-          className="flex items-center justify-between w-full -mx-4 px-4 py-2 rounded-xl
-                     hover:bg-surface-overlay transition-colors group"
+          disabled={!hasExtensionData(syncOptions)}
+          className="flex items-center justify-between -mx-4 px-4 py-2 rounded-xl
+                     hover:bg-surface-overlay transition-colors group
+                     disabled:opacity-40 disabled:hover:bg-transparent"
         >
-          <span className="text-sm text-white">Extensions to back up</span>
+          <span className="text-sm text-white">Choose extensions</span>
           <span className="text-muted text-xs group-hover:text-accent transition-colors">
             ›
           </span>
@@ -158,26 +209,13 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
       {/* Startup */}
       <div className="card p-4">
         <p className="section-label">Startup</p>
-        <div className="flex items-center justify-between mt-1">
-          <div>
-            <p className="text-sm text-white">Launch at login</p>
-            <p className="text-xs text-muted mt-0.5">
-              Start minimized to the system tray when you log in.
-            </p>
-          </div>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={autostart ? "true" : "false"}
-            aria-label="Launch at login"
-            onClick={handleAutostartToggle}
-            className={`
-              relative w-11 h-6 rounded-full transition-colors duration-200 appearance-none outline-none
-              ${autostart ? "bg-accent" : "bg-surface-border"}
-            `}
-          >
-            <span className={autostart ? "toggle-thumb-on" : "toggle-thumb-off"} />
-          </button>
+        <div className="mt-1">
+          <Switch
+            label="Launch at login"
+            description="Start minimized to the system tray when you log in."
+            checked={autostart}
+            onChange={handleAutostartToggle}
+          />
         </div>
       </div>
 
