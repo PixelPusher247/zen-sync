@@ -3,6 +3,7 @@ import type {
   AppStatus,
   BackupSummary,
   ExtensionWithSelection,
+  PrefWithSelection,
   RestoreReport,
   SnapshotInfo,
   SyncOptions,
@@ -46,6 +47,12 @@ export const bridge = {
 
   setExtensionSelection: (ids: string[]) =>
     invoke<void>("set_extension_selection_cmd", { ids }),
+
+  /** Every about:config pref this profile could sync, with its choice. */
+  getPrefs: () => invoke<PrefWithSelection[]>("get_prefs_with_selection_cmd"),
+
+  setPrefSelection: (names: string[]) =>
+    invoke<void>("set_pref_selection_cmd", { names }),
 
   isZenRunning: () => invoke<boolean>("is_zen_running"),
 

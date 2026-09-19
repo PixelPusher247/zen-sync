@@ -14,7 +14,7 @@
 
 ---
 
-[Zen Browser](https://www.zen-browser.app/) syncs spaces, containers, bookmarks and extension `storage.sync` data through your Mozilla account. Two things are still left out: [Sine](https://github.com/CosmoCreeper/Sine) mods with their settings, and the settings extensions keep in `storage.local`. Zen Sync backs up exactly those to a private GitHub repository, encrypted, whenever you choose.
+[Zen Browser](https://www.zen-browser.app/) syncs spaces, containers, bookmarks and extension `storage.sync` data through your Mozilla account. A few things are still left out: [Sine](https://github.com/CosmoCreeper/Sine) mods with their settings, the settings extensions keep in `storage.local`, the shortcuts you rebind in Zen's Keyboard Shortcuts panel, and anything you change in `about:config`. Zen Sync backs up exactly those to a private GitHub repository, encrypted, whenever you choose.
 
 Unlike [Zync](https://github.com/PixelPusher247/zync), there are no background daemons, no automatic triggers, and no network activity unless you click a button.
 
@@ -34,7 +34,7 @@ Unlike [Zync](https://github.com/PixelPusher247/zync), there are no background d
 ```
 
 1. **Backup** — Click "Back up now". Zen Sync zips your Sine mods, the values of the settings those mods declare, and the data of your selected extensions, encrypts the archive with AES-256-GCM, and uploads it as a release asset to a private `zen-sync-backup` repo in your GitHub account.
-2. **Restore** — Click "Restore latest backup" to restore the newest snapshot from any device, or open the History screen to pick an older one. Your mods folder is replaced with the snapshot's, mod settings are written into `prefs.js` one by one, and extension storage is copied in. Extension storage is tied to a per-profile UUID, so Zen Sync rewrites it to match the UUID the extension has on this device. Nothing else in `prefs.js` is touched, so device name and Mozilla account stay as they are.
+2. **Restore** — Click "Restore latest backup" to restore the newest snapshot from any device, or open the History screen to pick an older one. Your mods folder is replaced with the snapshot's, mod settings are written into `prefs.js` one by one, and extension storage is copied in. Extension storage is tied to a per-profile UUID, so Zen Sync rewrites it to match the UUID the extension has on this device. Zen's shortcuts file is replaced and the `about:config` prefs you picked are written in. Nothing else in `prefs.js` is touched, so device name and Mozilla account stay as they are.
 3. **Zen must be closed** — All operations are hard-blocked if Zen Browser is running, preventing database corruption and conflicting writes to files the browser holds open. The app notices within a couple of seconds when you close or open Zen.
 
 ---
@@ -45,7 +45,8 @@ Unlike [Zync](https://github.com/PixelPusher247/zync), there are no background d
 - **AES-256-GCM encryption** with PBKDF2-HMAC-SHA256 key derivation (100 k rounds); GitHub never sees plaintext data
 - **Encryption key in OS keychain** — stored in Windows Credential Manager, never on disk
 - **Works alongside Mozilla sync** — only data native sync doesn't cover is backed up; device identity and sync-account prefs are never read or written
-- **Choose what to sync** — turn Sine mods, mod settings, extension data, permissions and shortcuts on or off per device; the choice applies to both backups and restores on that device
+- **Choose what to sync** — turn Sine mods, mod settings, extension data, permissions, shortcuts, Zen's keyboard shortcuts and `about:config` prefs on or off per device; the choice applies to both backups and restores on that device
+- **Per-pref selection** — `about:config` sync is off until you turn it on, and the prefs screen lists every pref it would carry so you can drop individual ones; prefs that describe the machine are never offered
 - **Per-extension selection** — choose which extensions' data to include; password managers are excluded by default because their local storage holds your account session
 - **Snapshot history** — keeps the last N snapshots per device (default 3, configurable 1–10); restore any of them from the History screen
 - **Cross-device restore** — snapshots from all your devices appear in the History screen; you can restore any device's backup onto any other device
@@ -63,8 +64,14 @@ Unlike [Zync](https://github.com/PixelPusher247/zync), there are no background d
 | Extension storage | `storage/default/moz-extension+++<uuid>^userContextId=4294967295/` (`storage.local`) |
 | Extension permissions | The extension's entry in `extension-preferences.json` |
 | Extension shortcuts | The extension's entries under `commands` in `extension-settings.json` |
+| Zen shortcuts | `zen-keyboard-shortcuts.json`, with the `zen.keyboard.shortcuts.version` pref that says which schema it is in |
+| `about:config` prefs | The prefs in `prefs.js` you selected on the prefs screen |
 
 **Left to Mozilla sync:** spaces, containers, bookmarks, history, passwords, installed extensions, `storage.sync`. The Sine engine itself (`chrome/JS/`) must be installed on each device.
+
+**Never synced:** prefs that belong to the machine rather than to you — hardware and codec state, printers, sessions and profile databases, telemetry and update bookkeeping, download folders, your Mozilla account and device name, and any pref whose value is a local path. Extension state is left to the extension options above, and mod settings to Mod settings, so no pref has two owners.
+
+A restore only writes the prefs a snapshot carries. A pref you changed on this device but not on the one that made the snapshot is left alone, because a pref sitting at its default is absent from `prefs.js` either way and the two cases can't be told apart.
 
 ---
 

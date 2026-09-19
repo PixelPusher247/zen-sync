@@ -26,7 +26,13 @@ export function hasExtensionData(o: SyncOptions): boolean {
 }
 
 export function syncsAnything(o: SyncOptions): boolean {
-  return o.sineMods || o.modSettings || hasExtensionData(o);
+  return (
+    o.sineMods ||
+    o.modSettings ||
+    hasExtensionData(o) ||
+    o.zenShortcuts ||
+    o.aboutConfig
+  );
 }
 
 /** "Sine mods, mod settings and extension data" for the enabled options. */
@@ -35,6 +41,8 @@ export function describeSynced(o: SyncOptions): string {
     o.sineMods && "Sine mods",
     o.modSettings && "mod settings",
     hasExtensionData(o) && "extension data",
+    o.zenShortcuts && "Zen shortcuts",
+    o.aboutConfig && "about:config prefs",
   ].filter((item): item is string => Boolean(item));
   if (items.length <= 1) return items.join("");
   return `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;

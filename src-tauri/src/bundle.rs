@@ -1,5 +1,6 @@
-//! Snapshot bundle, format 3: a zip archive of Sine mods, mod setting values
-//! and per-extension data, described by `manifest.json`.
+//! Snapshot bundle, format 3: a zip archive of Sine mods, mod setting values,
+//! per-extension data, Zen's keyboard shortcuts and about:config prefs,
+//! described by `manifest.json`.
 //!
 //! Everything else in the profile (spaces, containers, bookmarks,
 //! `storage.sync`, ...) is left to Zen's built-in Mozilla account sync.
@@ -7,6 +8,10 @@
 //! Format 3 can leave out mod files or mod settings. Format 2 always had both,
 //! and zen-sync 0.2.x would wipe the mods folder restoring a snapshot without
 //! them, so the version was bumped to make those builds refuse it instead.
+//!
+//! Shortcuts and about:config prefs were added without a bump: they are extra
+//! manifest sections a 0.3.x build ignores, and it refuses any format above its
+//! own outright, which would have cost cross-version restores for nothing.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,7 +21,7 @@ use std::path::Path;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use crate::{ext_storage, extensions, fsutil, prefs, sine};
+use crate::{ext_storage, extensions, fsutil, prefs, shortcuts, sine};
 
 pub const FORMAT_VERSION: u8 = 3;
 /// Oldest format that can still be restored.
@@ -34,6 +39,8 @@ pub struct SyncOptions {
     pub extension_storage: bool,
     pub extension_permissions: bool,
     pub extension_shortcuts: bool,
+    pub zen_shortcuts: bool,
+    pub about_config: bool,
 }
 
 impl Default for SyncOptions {
@@ -44,6 +51,10 @@ impl Default for SyncOptions {
             extension_storage: true,
             extension_permissions: true,
             extension_shortcuts: true,
+            zen_shortcuts: true,
+            // Opt-in: prefs reach further into the profile than the other
+            // options, and which ones travel is worth a look first.
+            about_config: false,
         }
     }
 }
@@ -51,6 +62,14 @@ impl Default for SyncOptions {
 impl SyncOptions {
     fn any_extension_data(&self) -> bool {
         self.extension_storage || self.extension_permissions || self.extension_shortcuts
+    }
+
+    fn anything(&self) -> bool {
+        self.sine_mods
+            || self.mod_settings
+            || self.any_extension_data()
+            || self.zen_shortcuts
+            || self.about_config
     }
 }
 
@@ -60,6 +79,8 @@ pub struct Selection {
     pub options: SyncOptions,
     /// Per-extension choices, see [`extensions::is_selected`].
     pub extension_overrides: BTreeMap<String, bool>,
+    /// Per-pref choices for about:config, see [`prefs::is_selected`].
+    pub pref_overrides: BTreeMap<String, bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -68,6 +89,12 @@ pub struct Manifest {
     pub created_at: u64,
     pub sine: Option<SineSection>,
     pub extensions: Vec<ExtensionSection>,
+    /// Zen's keyboard shortcuts. Absent in format 2 and early format 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zen_shortcuts: Option<ShortcutsSection>,
+    /// about:config prefs. Absent in format 2 and early format 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub about_config: Option<AboutConfigSection>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -106,6 +133,21 @@ pub struct ExtensionSection {
     pub commands: BTreeMap<String, serde_json::Value>,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ShortcutsSection {
+    /// The whole `zen-keyboard-shortcuts.json` document.
+    pub data: serde_json::Value,
+    /// `zen.keyboard.shortcuts.version` on the source device, if it was set.
+    #[serde(default)]
+    pub version: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AboutConfigSection {
+    /// Pref name → raw prefs.js value literal.
+    pub prefs: BTreeMap<String, String>,
+}
+
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct BackupSummary {
@@ -115,6 +157,8 @@ pub struct BackupSummary {
     pub mod_setting_count: usize,
     pub extension_count: usize,
     pub storage_bytes: u64,
+    pub shortcut_count: usize,
+    pub pref_count: usize,
 }
 
 #[derive(Serialize, Debug, Default)]
@@ -122,6 +166,8 @@ pub struct BackupSummary {
 pub struct RestoreReport {
     pub mod_count: usize,
     pub extension_count: usize,
+    pub pref_count: usize,
+    pub shortcuts_restored: bool,
     pub warnings: Vec<String>,
 }
 
@@ -140,10 +186,13 @@ fn read_prefs(profile_dir: &Path) -> String {
     std::fs::read_to_string(profile_dir.join(PREFS_FILE)).unwrap_or_default()
 }
 
-/// What a backup of this profile would contain right now.
-pub fn summarize(profile_dir: &Path, overrides: &BTreeMap<String, bool>) -> BackupSummary {
+/// What a backup of this profile would contain right now, counting everything
+/// the per-item choices include. The on/off options are applied by the caller.
+pub fn summarize(profile_dir: &Path, selection: &Selection) -> BackupSummary {
+    let Selection { extension_overrides: overrides, pref_overrides, .. } = selection;
     let prefs_content = read_prefs(profile_dir);
     let has_mods = sine::has_mods(profile_dir);
+    let declared = sine::declared_prefs(profile_dir);
     let uuids = ext_storage::uuid_map(&prefs_content).unwrap_or_default();
 
     let mut extension_count = 0;
@@ -163,21 +212,35 @@ pub fn summarize(profile_dir: &Path, overrides: &BTreeMap<String, bool>) -> Back
         sine_engine_version: sine::engine_version(profile_dir),
         mod_count: if has_mods { sine::mod_count(profile_dir) } else { 0 },
         mod_setting_count: if has_mods {
-            prefs::read_values(&prefs_content, &sine::declared_prefs(profile_dir)).len()
+            prefs::read_values(&prefs_content, &declared).len()
         } else {
             0
         },
         extension_count,
         storage_bytes,
+        shortcut_count: shortcuts::read(profile_dir).as_ref().map_or(0, shortcuts::count),
+        pref_count: selected_prefs(&prefs_content, &declared, pref_overrides).len(),
     }
+}
+
+/// The about:config prefs this device would back up: everything syncable that
+/// no other sync option owns and the user has not turned off.
+fn selected_prefs(
+    prefs_content: &str,
+    owned: &BTreeSet<String>,
+    overrides: &BTreeMap<String, bool>,
+) -> BTreeMap<String, String> {
+    let mut candidates = prefs::syncable(prefs_content, owned);
+    candidates.retain(|name, _| prefs::is_selected(overrides, name));
+    candidates
 }
 
 // ── Backup ────────────────────────────────────────────────────────────────────
 
 /// Build a snapshot archive from the profile. Zen must be closed.
 pub fn build(profile_dir: &Path, selection: &Selection) -> Result<(Vec<u8>, Manifest), String> {
-    let Selection { options, extension_overrides: overrides } = selection;
-    if !options.sine_mods && !options.mod_settings && !options.any_extension_data() {
+    let Selection { options, extension_overrides: overrides, pref_overrides } = selection;
+    if !options.anything() {
         return Err("Nothing is selected to back up. Choose what to sync in Settings.".into());
     }
     let prefs_content = read_prefs(profile_dir);
@@ -279,7 +342,31 @@ pub fn build(profile_dir: &Path, selection: &Selection) -> Result<(Vec<u8>, Mani
         });
     }
 
-    if sine.is_none() && extension_sections.is_empty() {
+    let zen_shortcuts = options
+        .zen_shortcuts
+        .then(|| shortcuts::read(profile_dir))
+        .flatten()
+        .map(|data| {
+            crate::zslog!("[bundle] {} Zen shortcuts", shortcuts::count(&data));
+            ShortcutsSection { data, version: shortcuts::version(&prefs_content) }
+        });
+
+    let about_config = options
+        .about_config
+        .then(|| {
+            selected_prefs(&prefs_content, &sine::declared_prefs(profile_dir), pref_overrides)
+        })
+        .filter(|values| !values.is_empty())
+        .map(|values| {
+            crate::zslog!("[bundle] {} about:config prefs", values.len());
+            AboutConfigSection { prefs: values }
+        });
+
+    if sine.is_none()
+        && extension_sections.is_empty()
+        && zen_shortcuts.is_none()
+        && about_config.is_none()
+    {
         return Err("Nothing to back up: no Sine mods and no extension data found.".into());
     }
 
@@ -288,6 +375,8 @@ pub fn build(profile_dir: &Path, selection: &Selection) -> Result<(Vec<u8>, Mani
         created_at: now_epoch(),
         sine,
         extensions: extension_sections,
+        zen_shortcuts,
+        about_config,
     };
     zip.start_file(MANIFEST_NAME, file_options(CompressionMethod::Deflated))
         .map_err(zip_err)?;
@@ -344,7 +433,7 @@ pub fn apply(
     selection: &Selection,
     safety_dir: &Path,
 ) -> Result<RestoreReport, String> {
-    let Selection { options, extension_overrides: overrides } = selection;
+    let Selection { options, extension_overrides: overrides, pref_overrides } = selection;
     let mut archive = ZipArchive::new(Cursor::new(archive_bytes))
         .map_err(|e| format!("Snapshot is not a valid archive: {e}"))?;
     let manifest = read_manifest(&mut archive)?;
@@ -418,6 +507,7 @@ pub fn apply(
         PREFS_FILE.to_string(),
         ext_storage::PERMISSIONS_FILE.to_string(),
         ext_storage::SETTINGS_FILE.to_string(),
+        shortcuts::FILE.to_string(),
     ];
     if sine_mods.is_some() {
         to_save.push("chrome/sine-mods".into());
@@ -430,6 +520,47 @@ pub fn apply(
         }
     }
     crate::zslog!("[bundle] safety copy at {}", safety_dir.display());
+
+    // about:config prefs first, so the options that own particular prefs
+    // overwrite them below. Prefs the snapshot doesn't carry are left alone:
+    // a pref missing from prefs.js is one at its default *or* one this device
+    // never set, and the two can't be told apart.
+    if let Some(section) = manifest.about_config.as_ref().filter(|_| options.about_config) {
+        let owned = sine::declared_prefs(profile_dir);
+        for (name, value) in &section.prefs {
+            // Re-checked here: the snapshot may come from a build with a
+            // shorter exclusion list, or from a device that syncs more prefs.
+            if prefs::is_syncable(name, value)
+                && !owned.contains(name)
+                && prefs::is_selected(pref_overrides, name)
+            {
+                set_prefs.insert(name.clone(), value.clone());
+                report.pref_count += 1;
+            }
+        }
+        crate::zslog!(
+            "[bundle] about:config: {} of {} prefs",
+            report.pref_count,
+            section.prefs.len()
+        );
+    }
+
+    // Zen's shortcuts: the file, plus the pref that says which schema it is in.
+    if let Some(section) = manifest.zen_shortcuts.as_ref().filter(|_| options.zen_shortcuts) {
+        write_json(&shortcuts::path(profile_dir), Some(&section.data))?;
+        if let Some(version) = shortcuts::version_to_write(
+            section.version,
+            shortcuts::version(&prefs_content),
+        ) {
+            set_prefs.insert(shortcuts::VERSION_PREF.into(), version.to_string());
+        }
+        report.shortcuts_restored = true;
+        crate::zslog!(
+            "[bundle] {} Zen shortcuts (snapshot schema {:?})",
+            shortcuts::count(&section.data),
+            section.version
+        );
+    }
 
     // Sine mods: mirror the snapshot, then sync the declared settings.
     if let Some(section) = sine_mods {
@@ -956,6 +1087,8 @@ mod tests {
                 extension_storage: false,
                 extension_permissions: false,
                 extension_shortcuts: false,
+                zen_shortcuts: false,
+                about_config: false,
             },
             ..Selection::default()
         };
@@ -1036,5 +1169,195 @@ mod tests {
         let err = apply(dir.path(), &bytes, &Selection::default(),dir.path())
             .unwrap_err();
         assert!(err.contains("Unsupported snapshot format 4"));
+    }
+
+    /// A profile with nothing but the shortcuts file and its schema pref.
+    fn shortcuts_profile(root: &Path, version: i64, key: &str) {
+        write(
+            root,
+            "prefs.js",
+            &format!("user_pref(\"{}\", {version});\n", shortcuts::VERSION_PREF),
+        );
+        write(
+            root,
+            shortcuts::FILE,
+            &serde_json::json!({
+                "shortcuts": [
+                    { "id": "zen-workspace-switch-1", "key": key, "modifiers": { "alt": true } }
+                ]
+            })
+            .to_string(),
+        );
+    }
+
+    #[test]
+    fn zen_shortcuts_travel_with_their_schema_version() {
+        let source = tempdir().unwrap();
+        shortcuts_profile(source.path(), 20, "1");
+        let (bytes, manifest) = build(source.path(), &Selection::default()).unwrap();
+        let section = manifest.zen_shortcuts.as_ref().unwrap();
+        assert_eq!(section.version, Some(20));
+        assert_eq!(shortcuts::count(&section.data), 1);
+
+        // The target runs an older Zen, so the restore keeps the older schema
+        // number and lets that build migrate the file forward itself.
+        let target = tempdir().unwrap();
+        let t = target.path();
+        shortcuts_profile(t, 18, "9");
+
+        let report = apply(t, &bytes, &Selection::default(), tempdir().unwrap().path()).unwrap();
+        assert!(report.shortcuts_restored);
+
+        let restored = shortcuts::read(t).unwrap();
+        assert_eq!(restored["shortcuts"][0]["key"], "1");
+        let prefs_out = std::fs::read_to_string(t.join(PREFS_FILE)).unwrap();
+        assert_eq!(prefs::get_raw(&prefs_out, shortcuts::VERSION_PREF), Some("18"));
+    }
+
+    #[test]
+    fn zen_shortcuts_are_skipped_when_the_device_does_not_sync_them() {
+        let source = tempdir().unwrap();
+        shortcuts_profile(source.path(), 20, "1");
+        let off = Selection {
+            options: SyncOptions { zen_shortcuts: false, ..SyncOptions::default() },
+            ..Selection::default()
+        };
+        // Nothing else in this profile is worth a snapshot.
+        assert!(build(source.path(), &off).unwrap_err().contains("Nothing to back up"));
+
+        let (bytes, _) = build(source.path(), &Selection::default()).unwrap();
+        let target = tempdir().unwrap();
+        let t = target.path();
+        shortcuts_profile(t, 18, "9");
+        let report = apply(t, &bytes, &off, tempdir().unwrap().path()).unwrap();
+        assert!(!report.shortcuts_restored);
+        assert_eq!(shortcuts::read(t).unwrap()["shortcuts"][0]["key"], "9");
+    }
+
+    fn about_config_selection() -> Selection {
+        Selection {
+            options: SyncOptions { about_config: true, ..SyncOptions::default() },
+            ..Selection::default()
+        }
+    }
+
+    #[test]
+    fn about_config_carries_settings_but_not_device_state() {
+        let source = tempdir().unwrap();
+        write(
+            source.path(),
+            "prefs.js",
+            concat!(
+                "user_pref(\"zen.view.compact.hide-toolbar\", true);\n",
+                "user_pref(\"browser.tabs.loadInBackground\", false);\n",
+                "user_pref(\"mod.lean.hide-zoom\", true);\n",
+                "user_pref(\"gfx.blacklist.layers.direct2d\", 3);\n",
+                "user_pref(\"services.sync.client.name\", \"Source PC\");\n",
+            ),
+        );
+        write(source.path(), "chrome/sine-mods/mods.json", r#"{"lean":{}}"#);
+        write(
+            source.path(),
+            "chrome/sine-mods/lean/preferences.json",
+            r#"[{"property":"mod.lean.hide-zoom"}]"#,
+        );
+
+        let (bytes, manifest) = build(source.path(), &about_config_selection()).unwrap();
+        let carried: Vec<&str> =
+            manifest.about_config.as_ref().unwrap().prefs.keys().map(String::as_str).collect();
+        // Hardware state, the sync account and the mod setting each stay with
+        // their own owner.
+        assert_eq!(carried, vec!["browser.tabs.loadInBackground", "zen.view.compact.hide-toolbar"]);
+
+        let target = tempdir().unwrap();
+        let t = target.path();
+        write(
+            t,
+            "prefs.js",
+            concat!(
+                "user_pref(\"zen.view.compact.hide-toolbar\", false);\n",
+                "user_pref(\"services.sync.client.name\", \"Target PC\");\n",
+                "user_pref(\"browser.urlbar.suggest.history\", false);\n",
+            ),
+        );
+        let report = apply(t, &bytes, &about_config_selection(), tempdir().unwrap().path()).unwrap();
+        assert_eq!(report.pref_count, 2);
+
+        let out = std::fs::read_to_string(t.join(PREFS_FILE)).unwrap();
+        assert_eq!(prefs::get_raw(&out, "zen.view.compact.hide-toolbar"), Some("true"));
+        assert_eq!(prefs::get_raw(&out, "browser.tabs.loadInBackground"), Some("false"));
+        // This device's identity stays, and so do prefs the snapshot never had.
+        assert!(out.contains("user_pref(\"services.sync.client.name\", \"Target PC\");"));
+        assert_eq!(prefs::get_raw(&out, "browser.urlbar.suggest.history"), Some("false"));
+    }
+
+    #[test]
+    fn about_config_is_left_out_unless_the_device_turns_it_on() {
+        let source = tempdir().unwrap();
+        source_profile(source.path());
+        let mut prefs_js = std::fs::read_to_string(source.path().join(PREFS_FILE)).unwrap();
+        prefs_js.push_str("user_pref(\"zen.view.compact.hide-toolbar\", true);\n");
+        write(source.path(), PREFS_FILE, &prefs_js);
+
+        let (_, default_manifest) = build(source.path(), &Selection::default()).unwrap();
+        assert!(default_manifest.about_config.is_none());
+
+        // A snapshot that has prefs is ignored by a device that syncs none.
+        let (bytes, manifest) = build(source.path(), &about_config_selection()).unwrap();
+        assert!(manifest.about_config.is_some());
+        let target = tempdir().unwrap();
+        let t = target.path();
+        target_profile(t);
+        let report = apply(t, &bytes, &Selection::default(), tempdir().unwrap().path()).unwrap();
+        assert_eq!(report.pref_count, 0);
+    }
+
+    #[test]
+    fn prefs_turned_off_stay_out_of_the_backup_and_the_restore() {
+        let source = tempdir().unwrap();
+        write(
+            source.path(),
+            "prefs.js",
+            concat!(
+                "user_pref(\"zen.view.compact.hide-toolbar\", true);\n",
+                "user_pref(\"browser.tabs.loadInBackground\", false);\n",
+            ),
+        );
+        let deselected = Selection {
+            pref_overrides: BTreeMap::from([("browser.tabs.loadInBackground".to_string(), false)]),
+            ..about_config_selection()
+        };
+        let (_, manifest) = build(source.path(), &deselected).unwrap();
+        let carried = &manifest.about_config.as_ref().unwrap().prefs;
+        assert_eq!(carried.len(), 1);
+        assert!(carried.contains_key("zen.view.compact.hide-toolbar"));
+
+        // A pref turned off here is also ignored coming from another device.
+        let (all, _) = build(source.path(), &about_config_selection()).unwrap();
+        let target = tempdir().unwrap();
+        let t = target.path();
+        write(t, "prefs.js", "");
+        let report = apply(t, &all, &deselected, tempdir().unwrap().path()).unwrap();
+        assert_eq!(report.pref_count, 1);
+        let out = std::fs::read_to_string(t.join(PREFS_FILE)).unwrap();
+        assert!(!out.contains("browser.tabs.loadInBackground"));
+    }
+
+    #[test]
+    fn summary_counts_shortcuts_and_syncable_prefs() {
+        let dir = tempdir().unwrap();
+        shortcuts_profile(dir.path(), 20, "1");
+        write(
+            dir.path(),
+            "prefs.js",
+            concat!(
+                "user_pref(\"zen.keyboard.shortcuts.version\", 20);\n",
+                "user_pref(\"zen.view.compact.hide-toolbar\", true);\n",
+                "user_pref(\"gfx.blacklist.layers.direct2d\", 3);\n",
+            ),
+        );
+        let summary = summarize(dir.path(), &Selection::default());
+        assert_eq!(summary.shortcut_count, 1);
+        assert_eq!(summary.pref_count, 1);
     }
 }

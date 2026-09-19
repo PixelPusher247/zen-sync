@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// Prefs a restore must never write, even if a mod declares them as a setting.
 ///
@@ -94,6 +94,135 @@ pub fn parse_string_literal(raw: &str) -> Option<String> {
     serde_json::from_str(raw).ok()
 }
 
+// ── about:config selection ────────────────────────────────────────────────────
+
+/// Prefixes of prefs that describe this machine, this install or Firefox's own
+/// bookkeeping rather than anything the user configured. They are never offered
+/// as about:config settings.
+///
+/// The list errs towards leaving prefs out: a pref that is wrongly excluded is
+/// one the user sets again by hand, while a wrongly included one can carry
+/// another device's hardware, session or account state into this profile.
+const DEVICE_PREFIXES: &[&str] = &[
+    // Telemetry, experiments, first-run and update bookkeeping.
+    "app.normandy.",
+    "browser.contentblocking.cfr-milestone.",
+    "browser.contextual-services.",
+    "browser.laterrun.",
+    "browser.migration.",
+    "browser.newtabpage.activity-stream.impressionId",
+    "browser.region.",
+    "browser.safebrowsing.provider.",
+    "browser.startup.homepage_override.",
+    "browser.startup.lastColdStartupCheck",
+    "datareporting.",
+    "doh-rollout.",
+    "messaging-system.",
+    "nimbus.",
+    "toolkit.telemetry.",
+    // Session state, profile databases and crash history.
+    "browser.sessionstore.",
+    "browser.slowStartup.",
+    "places.database.",
+    "privacy.purge_trackers.",
+    "privacy.sanitize.pending",
+    "storage.vacuum.last.",
+    "toolkit.crashreporter.",
+    "toolkit.startup.",
+    // Hardware, codecs and printers.
+    "gfx.",
+    "layers.",
+    "media.benchmark.",
+    "media.gmp",
+    "print.",
+    "print_printer",
+    "printer_",
+    // Extension state: the extension sync options carry what belongs to an
+    // extension, and the Mozilla account installs the extensions themselves.
+    "extensions.",
+    // Per-profile or per-network identity.
+    "distribution.",
+    "dom.push.",
+    "network.proxy.",
+    // Owned by other sync options.
+    "sine.",
+];
+
+/// Single prefs excluded for the same reasons as [`DEVICE_PREFIXES`], where the
+/// surrounding branch holds settings worth syncing.
+const DEVICE_KEYS: &[&str] = &[
+    "browser.EULA.version",
+    "browser.bookmarks.restore_default_bookmarks",
+    "browser.download.dir",
+    "browser.download.folderList",
+    "browser.download.lastDir",
+    "browser.shell.mostRecentDateSetAsDefault",
+    "idle.lastDailyNotification",
+    "media.hardware-video-decoding.failed",
+    "pdfjs.migrationVersion",
+    "pdfjs.previousHandler.alwaysAskBeforeHandling",
+    "pdfjs.previousHandler.preferredAction",
+    "security.sandbox.content.tempDirSuffix",
+    "signon.importedFromSqlite",
+    // The Zen shortcuts option writes this one alongside the shortcuts file.
+    "zen.keyboard.shortcuts.version",
+];
+
+/// Whether a raw value literal points into the local filesystem. Prefs holding
+/// a path are device state whatever they are called, so this catches ones the
+/// name lists don't know about.
+fn is_local_path(raw_value: &str) -> bool {
+    let has_drive_letter = raw_value
+        .as_bytes()
+        .windows(3)
+        .any(|w| w[0].is_ascii_alphabetic() && w[1] == b':' && w[2] == b'\\');
+    has_drive_letter
+        || raw_value.contains("file:///")
+        || raw_value.to_ascii_lowercase().contains("appdata")
+}
+
+/// Whether a pref can travel between devices as an about:config setting.
+pub fn is_syncable(name: &str, raw_value: &str) -> bool {
+    !is_protected(name)
+        && !DEVICE_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+        && !DEVICE_KEYS.contains(&name)
+        && !is_local_path(raw_value)
+}
+
+/// Every pref in `content` this device could sync as an about:config setting,
+/// with its raw value literal. Names in `owned` are left out: another sync
+/// option already carries them.
+pub fn syncable(content: &str, owned: &BTreeSet<String>) -> BTreeMap<String, String> {
+    content
+        .lines()
+        .filter_map(parse_line)
+        .filter(|(name, value)| is_syncable(name, value) && !owned.contains(*name))
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+}
+
+/// Whether a syncable pref is included. Prefs without an explicit choice are.
+pub fn is_selected(overrides: &BTreeMap<String, bool>, name: &str) -> bool {
+    overrides.get(name).copied().unwrap_or(true)
+}
+
+/// Record the user's choice for the prefs currently on offer, storing only the
+/// ones turned off. Choices for prefs this profile no longer has are kept.
+pub fn update_overrides(
+    overrides: &mut BTreeMap<String, bool>,
+    candidates: &BTreeSet<String>,
+    selected_names: &[String],
+) {
+    let selected: HashSet<&str> = selected_names.iter().map(String::as_str).collect();
+    for name in candidates {
+        if selected.contains(name.as_str()) {
+            overrides.remove(name);
+        } else {
+            overrides.insert(name.clone(), false);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +284,62 @@ user_pref("zen.mods.AudioIndicatorEnhanced.audioWave.opacity", "0.2");
         let literal = string_literal(json);
         assert_eq!(literal, r#""{\"a@b\":\"1234\"}""#);
         assert_eq!(parse_string_literal(&literal).as_deref(), Some(json));
+    }
+
+    const PROFILE_PREFS: &str = r#"// Mozilla User Preferences
+user_pref("zen.view.compact.hide-toolbar", true);
+user_pref("zen.workspaces.container-specific-essentials-enabled", false);
+user_pref("browser.tabs.loadInBackground", false);
+user_pref("mod.lean.hide-zoom", true);
+user_pref("sine.allow-unsafe-js", true);
+user_pref("extensions.lastAppVersion", "1.15b");
+user_pref("gfx.blacklist.layers.direct2d", 3);
+user_pref("app.update.lastUpdateTime.background-update-timer", 1789000000);
+user_pref("browser.download.lastDir", "C:\Users\dev\Downloads");
+user_pref("zen.keyboard.shortcuts.version", 20);
+user_pref("print_printer", "Brother HL-2030");
+"#;
+
+    #[test]
+    fn syncable_keeps_settings_and_drops_device_state() {
+        let owned = names(&["mod.lean.hide-zoom"]);
+        let syncable = syncable(PROFILE_PREFS, &owned);
+
+        let kept: Vec<&str> = syncable.keys().map(String::as_str).collect();
+        assert_eq!(
+            kept,
+            vec![
+                "browser.tabs.loadInBackground",
+                "zen.view.compact.hide-toolbar",
+                "zen.workspaces.container-specific-essentials-enabled",
+            ]
+        );
+        assert_eq!(syncable["zen.view.compact.hide-toolbar"], "true");
+    }
+
+    #[test]
+    fn unknown_prefs_holding_a_local_path_are_not_syncable() {
+        assert!(!is_syncable("some.addon.cachePath", r#""C:\Users\dev\cache""#));
+        assert!(!is_syncable("some.addon.source", r#""file:///C:/tmp/x.js""#));
+        assert!(is_syncable("some.addon.mode", r#""C: drive""#));
+        assert!(is_syncable("browser.urlbar.suggest.history", "false"));
+    }
+
+    #[test]
+    fn pref_overrides_store_only_prefs_turned_off() {
+        let candidates = names(&["zen.a", "zen.b", "zen.c"]);
+        let mut overrides = BTreeMap::new();
+        overrides.insert("gone.from.profile".to_string(), false);
+
+        update_overrides(&mut overrides, &candidates, &["zen.a".to_string(), "zen.c".to_string()]);
+
+        assert_eq!(overrides.len(), 2);
+        assert!(!overrides["zen.b"]);
+        assert!(is_selected(&overrides, "zen.a"));
+        assert!(!is_selected(&overrides, "zen.b"));
+        assert!(is_selected(&overrides, "never.seen"));
+        // A choice about a pref that is no longer set here survives.
+        assert!(!is_selected(&overrides, "gone.from.profile"));
     }
 
     #[test]

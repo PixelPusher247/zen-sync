@@ -17,6 +17,8 @@ const SYNC_ITEMS: { key: keyof SyncOptions; label: string; description: string }
   { key: "extensionStorage", label: "Extension data", description: "What extensions keep in local storage" },
   { key: "extensionPermissions", label: "Extension permissions", description: "Optional permissions you granted" },
   { key: "extensionShortcuts", label: "Extension shortcuts", description: "Custom keyboard shortcuts" },
+  { key: "zenShortcuts", label: "Zen shortcuts", description: "Workspace, compact mode and other Zen keys" },
+  { key: "aboutConfig", label: "about:config prefs", description: "Settings you changed in about:config" },
 ];
 
 export default function SettingsScreen({ status, onStatusChange, onNavigate }: Props) {
@@ -200,6 +202,19 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
                      disabled:opacity-40 disabled:hover:bg-transparent"
         >
           <span className="text-sm text-white">Choose extensions</span>
+          <span className="text-muted text-xs group-hover:text-accent transition-colors">
+            ›
+          </span>
+        </button>
+        <button
+          type="button"
+          onClick={() => onNavigate("prefs")}
+          disabled={!syncOptions.aboutConfig}
+          className="flex items-center justify-between -mx-4 px-4 py-2 rounded-xl
+                     hover:bg-surface-overlay transition-colors group
+                     disabled:opacity-40 disabled:hover:bg-transparent"
+        >
+          <span className="text-sm text-white">Choose prefs</span>
           <span className="text-muted text-xs group-hover:text-accent transition-colors">
             ›
           </span>

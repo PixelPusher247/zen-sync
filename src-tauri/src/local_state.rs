@@ -16,6 +16,10 @@ pub struct LocalState {
     /// (included, unless it's a password manager). Keyed by extension ID.
     #[serde(default)]
     pub extension_overrides: BTreeMap<String, bool>,
+    /// about:config prefs the user turned off, keyed by pref name. Prefs
+    /// without an entry are included.
+    #[serde(default)]
+    pub pref_overrides: BTreeMap<String, bool>,
     #[serde(default)]
     pub sync_options: SyncOptions,
 }
@@ -28,6 +32,7 @@ impl Default for LocalState {
             snapshot_count: 3,
             autostart_enabled: false,
             extension_overrides: BTreeMap::new(),
+            pref_overrides: BTreeMap::new(),
             sync_options: SyncOptions::default(),
         }
     }
@@ -85,6 +90,7 @@ mod tests {
                 ("ext-a@test".to_string(), false),
                 ("ext-b@test".to_string(), true),
             ]),
+            pref_overrides: BTreeMap::from([("browser.tabs.warnOnClose".to_string(), false)]),
             sync_options: SyncOptions {
                 sine_mods: false,
                 ..SyncOptions::default()
@@ -115,5 +121,8 @@ mod tests {
         let s = LocalState::load(dir.path());
         assert!(!s.sync_options.sine_mods);
         assert!(s.sync_options.extension_shortcuts);
+        assert!(s.sync_options.zen_shortcuts);
+        // about:config stays off until it is turned on deliberately.
+        assert!(!s.sync_options.about_config);
     }
 }

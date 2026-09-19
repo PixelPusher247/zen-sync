@@ -13,6 +13,8 @@ export default function RestoreResult({ report, onDismiss }: Props) {
   const parts = [
     report.modCount > 0 && plural(report.modCount, "mod"),
     report.extensionCount > 0 && plural(report.extensionCount, "extension"),
+    report.shortcutsRestored && "Zen shortcuts",
+    report.prefCount > 0 && plural(report.prefCount, "pref"),
   ].filter(Boolean);
 
   return (

@@ -7,6 +7,7 @@ import DashboardScreen from "./screens/DashboardScreen";
 import SnapshotsScreen from "./screens/SnapshotsScreen";
 import SettingsScreen from "./screens/SettingsScreen";
 import ExtensionsScreen from "./screens/ExtensionsScreen";
+import PrefsScreen from "./screens/PrefsScreen";
 import UpdateBanner from "./components/UpdateBanner";
 import NavBar from "./components/NavBar";
 import { FloatingTitleBar } from "./components/WindowControls";
@@ -66,16 +67,19 @@ export default function App() {
     );
   }
 
+  // These screens bring their own header, with the close button in it.
+  const isFullScreen = screen === "extensions" || screen === "prefs";
+
   return (
     <div className="h-full flex flex-col bg-surface animate-fade-in">
       {/* Header first so the close button stays in the window corner. */}
-      {screen !== "extensions" && (
+      {!isFullScreen && (
         <NavBar
           screen={screen}
           onNavigate={setScreen}
         />
       )}
-      {update && screen !== "extensions" && (
+      {update && !isFullScreen && (
         <UpdateBanner
           info={update}
           onDismiss={() => setUpdate(null)}
@@ -101,6 +105,9 @@ export default function App() {
         )}
         {screen === "extensions" && (
           <ExtensionsScreen onBack={() => setScreen("settings")} />
+        )}
+        {screen === "prefs" && (
+          <PrefsScreen onBack={() => setScreen("settings")} />
         )}
       </main>
     </div>

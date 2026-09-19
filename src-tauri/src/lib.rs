@@ -8,6 +8,7 @@ mod local_state;
 pub mod logger;
 mod prefs;
 mod profile;
+mod shortcuts;
 mod sine;
 mod sync;
 mod zen_check;
@@ -29,6 +30,7 @@ impl AppState {
         bundle::Selection {
             options: self.local_state.sync_options.clone(),
             extension_overrides: self.local_state.extension_overrides.clone(),
+            pref_overrides: self.local_state.pref_overrides.clone(),
         }
     }
 
@@ -168,6 +170,8 @@ pub fn run() {
             set_autostart_cmd,
             get_extensions_with_selection_cmd,
             set_extension_selection_cmd,
+            get_prefs_with_selection_cmd,
+            set_pref_selection_cmd,
             open_log_cmd,
             get_log_cmd,
             install_update,
@@ -392,8 +396,8 @@ fn get_backup_summary_cmd(
 ) -> Result<bundle::BackupSummary, String> {
     let profile_dir = profile::find_zen_profile()
         .ok_or("Zen profile folder not found. Is Zen Browser installed?")?;
-    let overrides = state.lock().unwrap().local_state.extension_overrides.clone();
-    Ok(bundle::summarize(&profile_dir, &overrides))
+    let selection = state.lock().unwrap().selection();
+    Ok(bundle::summarize(&profile_dir, &selection))
 }
 
 #[tauri::command]
@@ -548,6 +552,55 @@ fn set_extension_selection_cmd(
     let installed = extensions::list_extensions(&profile_dir)?;
     let mut s = state.lock().unwrap();
     extensions::update_overrides(&mut s.local_state.extension_overrides, &installed, &ids);
+    let config_dir = s.config_dir.clone();
+    s.local_state.save(&config_dir)
+}
+
+/// One about:config pref this device could sync, for the review screen.
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PrefWithSelection {
+    pub name: String,
+    /// The raw prefs.js value literal, shown as-is.
+    pub value: String,
+    pub synced: bool,
+}
+
+/// Every syncable pref in this profile, with the user's choice for each.
+#[tauri::command]
+fn get_prefs_with_selection_cmd(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<PrefWithSelection>, String> {
+    let profile_dir = profile::find_zen_profile()
+        .ok_or("Zen profile folder not found. Is Zen Browser installed?")?;
+    let content = std::fs::read_to_string(profile_dir.join("prefs.js"))
+        .map_err(|e| format!("Could not read prefs.js: {e}"))?;
+    let overrides = state.lock().unwrap().local_state.pref_overrides.clone();
+    Ok(prefs::syncable(&content, &sine::declared_prefs(&profile_dir))
+        .into_iter()
+        .map(|(name, value)| PrefWithSelection {
+            synced: prefs::is_selected(&overrides, &name),
+            name,
+            value,
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn set_pref_selection_cmd(
+    names: Vec<String>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let profile_dir = profile::find_zen_profile()
+        .ok_or("Zen profile folder not found. Is Zen Browser installed?")?;
+    let content = std::fs::read_to_string(profile_dir.join("prefs.js"))
+        .map_err(|e| format!("Could not read prefs.js: {e}"))?;
+    let candidates: std::collections::BTreeSet<String> =
+        prefs::syncable(&content, &sine::declared_prefs(&profile_dir))
+            .into_keys()
+            .collect();
+    let mut s = state.lock().unwrap();
+    prefs::update_overrides(&mut s.local_state.pref_overrides, &candidates, &names);
     let config_dir = s.config_dir.clone();
     s.local_state.save(&config_dir)
 }

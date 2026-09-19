@@ -40,7 +40,13 @@
     "PixelPusher",
     "frameless",
     "DWMWA",
-    "DWMWCP"
+    "DWMWCP",
+    "pdfjs",
+    "urlbar",
+    "gmp",
+    "doh",
+    "Normandy",
+    "kbs"
   ],
   "ignorePaths": [
     "node_modules",

@@ -24,6 +24,8 @@ export interface SyncOptions {
   extensionStorage: boolean;
   extensionPermissions: boolean;
   extensionShortcuts: boolean;
+  zenShortcuts: boolean;
+  aboutConfig: boolean;
 }
 
 export interface UpdateInfo {
@@ -52,12 +54,29 @@ export interface BackupSummary {
   modSettingCount: number;
   extensionCount: number;
   storageBytes: number;
+  shortcutCount: number;
+  prefCount: number;
 }
 
 export interface RestoreReport {
   modCount: number;
   extensionCount: number;
+  prefCount: number;
+  shortcutsRestored: boolean;
   warnings: string[];
 }
 
-export type Screen = "setup" | "dashboard" | "snapshots" | "settings" | "extensions";
+export interface PrefWithSelection {
+  name: string;
+  /** The raw prefs.js value literal, shown as written. */
+  value: string;
+  synced: boolean;
+}
+
+export type Screen =
+  | "setup"
+  | "dashboard"
+  | "snapshots"
+  | "settings"
+  | "extensions"
+  | "prefs";
