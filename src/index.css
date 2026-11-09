@@ -17,11 +17,19 @@
     padding: 0;
     background: #0f0f13;
     color: #e5e7eb;
-    font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-family: "Inter Variable", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     font-size: 14px;
     line-height: 1.5;
     -webkit-user-select: none;
     user-select: none;
+    /* Native controls (range track, search clear button) follow the dark theme. */
+    color-scheme: dark;
+  }
+
+  /* One visible keyboard focus ring everywhere; mouse clicks don't show it. */
+  :focus-visible {
+    outline: 2px solid #9180f9;
+    outline-offset: 2px;
   }
 
   /* Custom scrollbar */
@@ -99,6 +107,23 @@
 
   .divider {
     @apply border-t border-surface-border;
+  }
+
+  /* Range input drawn in the app's colours; --fill is the filled share, set inline. */
+  .slider {
+    @apply h-1.5 rounded-full cursor-pointer;
+    -webkit-appearance: none;
+    appearance: none;
+    background: linear-gradient(
+      to right,
+      theme("colors.accent.DEFAULT") var(--fill, 0%),
+      theme("colors.surface.border") var(--fill, 0%)
+    );
+  }
+  .slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    @apply w-4 h-4 rounded-full bg-white shadow;
   }
 
   .toggle-thumb-off {

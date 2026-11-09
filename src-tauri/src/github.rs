@@ -204,6 +204,9 @@ async fn fetch_user(http: &reqwest::Client, token: &str) -> Result<(u64, String)
     Ok((user.id, user.login))
 }
 
+/// How long the browser sign-in may take before the attempt is given up.
+const OAUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 pub async fn oauth_connect(app: &tauri::AppHandle) -> Result<(String, u64, String), String> {
     use tauri_plugin_opener::OpenerExt;
 
@@ -226,9 +229,15 @@ pub async fn oauth_connect(app: &tauri::AppHandle) -> Result<(String, u64, Strin
         .open_url(auth_url, None::<&str>)
         .map_err(|e| format!("Failed to open browser: {e}"))?;
 
-    let redirect_url = rx
-        .await
-        .map_err(|_| "OAuth cancelled or timed out".to_string())?;
+    // An abandoned sign-in would otherwise wait forever and leave the local
+    // callback server listening.
+    let redirect_url = match tokio::time::timeout(OAUTH_TIMEOUT, rx).await {
+        Ok(Ok(url)) => url,
+        _ => {
+            let _ = tauri_plugin_oauth::cancel(port);
+            return Err("GitHub sign-in wasn't finished in time. Try again.".to_string());
+        }
+    };
 
     let code = redirect_url
         .split('?')

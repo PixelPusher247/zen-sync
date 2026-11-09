@@ -1,3 +1,4 @@
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AppStatus,
@@ -61,4 +62,6 @@ export const bridge = {
   openLog: () => invoke<void>("open_log_cmd"),
 
   getLog: () => invoke<string>("get_log_cmd"),
+
+  getVersion: () => getVersion(),
 };

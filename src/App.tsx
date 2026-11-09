@@ -10,7 +10,9 @@ import ExtensionsScreen from "./screens/ExtensionsScreen";
 import PrefsScreen from "./screens/PrefsScreen";
 import UpdateBanner from "./components/UpdateBanner";
 import NavBar from "./components/NavBar";
+import OperationStatus from "./components/OperationStatus";
 import { FloatingTitleBar } from "./components/WindowControls";
+import { OperationsProvider } from "./hooks/useOperations";
 
 export default function App() {
   const [status, setStatus] = useState<AppStatus | null>(null);
@@ -51,7 +53,11 @@ export default function App() {
     return (
       <div className="relative h-full flex items-center justify-center bg-surface">
         <FloatingTitleBar />
-        <div className="w-6 h-6 border-2 border-accent border-t-transparent rounded-full animate-spin" />
+        <div
+          role="status"
+          aria-label="Loading"
+          className="w-6 h-6 border-2 border-accent border-t-transparent rounded-full animate-spin"
+        />
       </div>
     );
   }
@@ -71,45 +77,34 @@ export default function App() {
   const isFullScreen = screen === "extensions" || screen === "prefs";
 
   return (
-    <div className="h-full flex flex-col bg-surface animate-fade-in">
-      {/* Header first so the close button stays in the window corner. */}
-      {!isFullScreen && (
-        <NavBar
-          screen={screen}
-          onNavigate={setScreen}
-        />
-      )}
-      {update && !isFullScreen && (
-        <UpdateBanner
-          info={update}
-          onDismiss={() => setUpdate(null)}
-        />
-      )}
-      <main className="flex-1 overflow-y-auto">
-        {screen === "dashboard" && (
-          <DashboardScreen
-            status={status}
-            onStatusChange={setStatus}
-            onNavigate={setScreen}
-          />
+    <OperationsProvider status={status} onStatusChange={setStatus}>
+      <div className="h-full flex flex-col bg-surface animate-fade-in">
+        {/* Header first so the close button stays in the window corner. */}
+        {!isFullScreen && <NavBar screen={screen} onNavigate={setScreen} />}
+        {update && !isFullScreen && (
+          <UpdateBanner info={update} onDismiss={() => setUpdate(null)} />
         )}
-        {screen === "snapshots" && (
-          <SnapshotsScreen status={status} onStatusChange={setStatus} />
-        )}
-        {screen === "settings" && (
-          <SettingsScreen
-            status={status}
-            onStatusChange={setStatus}
-            onNavigate={setScreen}
-          />
-        )}
-        {screen === "extensions" && (
-          <ExtensionsScreen onBack={() => setScreen("settings")} />
-        )}
-        {screen === "prefs" && (
-          <PrefsScreen onBack={() => setScreen("settings")} />
-        )}
-      </main>
-    </div>
+        {!isFullScreen && <OperationStatus />}
+        <main className="flex-1 min-h-0 overflow-y-auto">
+          {screen === "dashboard" && (
+            <DashboardScreen status={status} onNavigate={setScreen} />
+          )}
+          {screen === "snapshots" && <SnapshotsScreen status={status} />}
+          {screen === "settings" && (
+            <SettingsScreen
+              status={status}
+              onStatusChange={setStatus}
+              onNavigate={setScreen}
+            />
+          )}
+          {screen === "extensions" && (
+            <ExtensionsScreen onBack={() => setScreen("settings")} />
+          )}
+          {screen === "prefs" && (
+            <PrefsScreen onBack={() => setScreen("settings")} />
+          )}
+        </main>
+      </div>
+    </OperationsProvider>
   );
 }

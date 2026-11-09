@@ -227,7 +227,7 @@ are kept.
 | Browser stuck in weird state after restore | Hard block: refuses all operations while Zen is running |
 | Device name overwritten on restore | Only mod settings are written to `prefs.js`; account and device prefs are never touched |
 | Auto-sync happening without user action | No background daemons — 100% manual trigger |
-| Autostart enabled by default | Off by default; toggle in tray or Settings |
+| Autostart enabled by default | Off by default; toggle in Settings |
 | All extensions always synced | Per-extension toggle in Settings → Extensions to back up |
 
 ---

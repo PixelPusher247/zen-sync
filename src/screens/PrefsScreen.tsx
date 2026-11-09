@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { bridge } from "../bridge";
 import type { PrefWithSelection } from "../types";
-import { CloseButton } from "../components/WindowControls";
+import PickerHeader, { SelectAllNone } from "../components/PickerHeader";
+import { useAutosave } from "../hooks/useAutosave";
 
 interface Props {
   onBack: () => void;
@@ -18,20 +19,21 @@ function displayValue(raw: string): string {
 export default function PrefsScreen({ onBack }: Props) {
   const [prefs, setPrefs] = useState<PrefWithSelection[] | null>(null);
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
-  // Local toggle state — key: pref name, value: synced
-  const [toggles, setToggles] = useState<Record<string, boolean>>({});
+  // Names of the prefs that travel between devices.
+  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
+  const autosave = useAutosave((names: string[]) => bridge.setPrefSelection(names));
 
   const load = useCallback(async () => {
+    setLoading(true);
+    setLoadError(null);
     try {
       const list = await bridge.getPrefs();
       setPrefs(list);
-      setToggles(Object.fromEntries(list.map((p) => [p.name, p.synced])));
+      setSelected(new Set(list.filter((p) => p.synced).map((p) => p.name)));
     } catch (e) {
-      setError(String(e));
+      setLoadError(String(e));
     } finally {
       setLoading(false);
     }
@@ -52,100 +54,75 @@ export default function PrefsScreen({ onBack }: Props) {
     );
   }, [prefs, filter]);
 
+  /** Every change is saved straight away, like the switches in Settings. */
+  function apply(next: Set<string>) {
+    setSelected(next);
+    autosave.push([...next]);
+  }
+
   function toggle(name: string) {
-    setToggles((prev) => ({ ...prev, [name]: !prev[name] }));
+    const next = new Set(selected);
+    if (!next.delete(name)) next.add(name);
+    apply(next);
   }
 
-  /** All / None act on what the filter is showing. */
+  /** All / none act on what the filter is showing. */
   function setVisible(on: boolean) {
-    setToggles((prev) => {
-      const next = { ...prev };
-      for (const p of visible) next[p.name] = on;
-      return next;
-    });
-  }
-
-  const selectedCount = Object.values(toggles).filter(Boolean).length;
-  const allSelected = visible.length > 0 && visible.every((p) => toggles[p.name]);
-  const noneSelected = visible.every((p) => !toggles[p.name]);
-
-  async function handleSave() {
-    setSaving(true);
-    setError(null);
-    try {
-      await bridge.setPrefSelection(
-        prefs?.filter((p) => toggles[p.name]).map((p) => p.name) ?? [],
-      );
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2500);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setSaving(false);
+    const next = new Set(selected);
+    for (const p of visible) {
+      if (on) next.add(p.name);
+      else next.delete(p.name);
     }
+    apply(next);
   }
+
+  const count = prefs?.length ?? 0;
+  const filtered = visible.length !== count;
+  const allSelected = visible.length > 0 && visible.every((p) => selected.has(p.name));
+  const noneSelected = visible.every((p) => !selected.has(p.name));
 
   return (
     <div className="flex flex-col h-full animate-fade-in">
-      {/* Header */}
-      <div
-        data-tauri-drag-region="deep"
-        className="flex items-center gap-3 pl-5 pr-3 py-3.5 border-b border-surface-border bg-surface-raised"
-      >
-        <button
-          type="button"
-          onClick={onBack}
-          className="text-muted hover:text-white transition-colors text-sm"
-        >
-          ← Back
-        </button>
-        <div className="flex-1">
-          <h2 className="text-sm font-semibold text-white">about:config</h2>
-          <p className="text-xs text-muted">
-            Choose which prefs travel between your devices
-          </p>
-        </div>
-        {prefs && prefs.length > 0 && (
-          <div className="flex items-center gap-1">
-            <button
-              type="button"
-              onClick={() => setVisible(true)}
-              disabled={allSelected}
-              className="text-xs text-accent hover:text-accent-hover disabled:opacity-40 transition-colors"
-            >
-              All
-            </button>
-            <span className="text-muted text-xs">/</span>
-            <button
-              type="button"
-              onClick={() => setVisible(false)}
-              disabled={noneSelected}
-              className="text-xs text-muted hover:text-white disabled:opacity-40 transition-colors"
-            >
-              None
-            </button>
-          </div>
-        )}
-        <CloseButton />
-      </div>
+      <PickerHeader
+        title="about:config"
+        subtitle="Prefs that travel between your devices"
+        saveState={autosave.state}
+        onBack={onBack}
+      />
 
-      {/* Content */}
-      <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-3">
+      <div className="flex-1 min-h-0 overflow-y-auto p-4 flex flex-col gap-3">
         {loading && (
-          <div className="flex items-center justify-center py-10">
+          <div className="flex items-center justify-center py-10" role="status" aria-label="Loading prefs">
             <div className="w-5 h-5 border-2 border-accent border-t-transparent rounded-full animate-spin" />
           </div>
         )}
 
-        {error && (
-          <div className="p-3 bg-danger/10 border border-danger/20 rounded-xl text-sm text-danger">
-            {error}
+        {loadError && (
+          <div role="alert" className="p-3 bg-danger/10 border border-danger/20 rounded-xl text-sm text-danger">
+            <p className="select-text break-words">{loadError}</p>
+            <button type="button" onClick={load} className="mt-2 text-xs underline opacity-80 hover:opacity-100">
+              Try again
+            </button>
           </div>
         )}
 
-        {!loading && prefs?.length === 0 && (
+        {autosave.error && (
+          <div role="alert" className="p-3 bg-danger/10 border border-danger/20 rounded-xl text-sm text-danger">
+            <p className="font-medium">Couldn't save your selection</p>
+            <p className="text-xs mt-1 select-text break-words">{autosave.error}</p>
+            <button
+              type="button"
+              onClick={() => autosave.push([...selected])}
+              className="mt-2 text-xs underline opacity-80 hover:opacity-100"
+            >
+              Try again
+            </button>
+          </div>
+        )}
+
+        {!loading && !loadError && count === 0 && (
           <div className="card p-6 text-center">
-            <p className="text-muted text-sm">Nothing to sync yet.</p>
+            <p className="text-subtle text-sm">Nothing to sync yet.</p>
             <p className="text-muted text-xs mt-1">
               Prefs you change in about:config show up here. Mod settings,
               extension state and anything tied to this machine are left out.
@@ -153,97 +130,81 @@ export default function PrefsScreen({ onBack }: Props) {
           </div>
         )}
 
-        {!loading && prefs && prefs.length > 0 && (
+        {!loading && prefs && count > 0 && (
           <>
             <p className="text-xs text-muted">
-              {selectedCount} of {prefs.length} prefs will be backed up and
-              applied on restore. Prefs describing this machine — hardware,
-              sessions, profile paths, your Mozilla account — are never offered,
-              and prefs missing from a snapshot are left as they are here.
+              Selected prefs are backed up and applied on restore. Prefs
+              describing this machine — hardware, sessions, profile paths, your
+              Mozilla account — are never offered.
             </p>
 
             <input
               type="search"
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
-              placeholder="Filter prefs…"
+              placeholder="Filter by name or value…"
               className="input w-full"
               aria-label="Filter prefs"
             />
 
-            <div className="flex flex-col gap-1.5">
-              {visible.map((pref) => {
-                const isOn = toggles[pref.name] ?? true;
-                return (
-                  <button
-                    key={pref.name}
-                    type="button"
-                    className={`card px-3.5 py-2.5 flex items-center gap-3 w-full text-left
-                      hover:border-surface-overlay transition-colors
-                      ${isOn ? "" : "opacity-50"}`}
-                    onClick={() => toggle(pref.name)}
-                  >
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-white truncate">
-                        {pref.name}
-                      </p>
-                      <p className="text-xs text-muted truncate font-mono">
-                        {displayValue(pref.value)}
-                      </p>
-                    </div>
-                    <div
-                      className={`w-9 h-5 rounded-full transition-colors duration-200 shrink-0
-                        ${isOn ? "bg-accent" : "bg-surface-border"}`}
-                    >
-                      <span className={isOn ? "toggle-sm-thumb-on" : "toggle-sm-thumb-off"} />
-                    </div>
-                  </button>
-                );
-              })}
-              {visible.length === 0 && (
-                <p className="text-xs text-muted text-center py-6">
-                  No pref matches “{filter}”.
-                </p>
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-xs text-subtle font-medium">
+                {selected.size} of {count} selected
+                {filtered && <span className="text-muted font-normal"> · {visible.length} shown</span>}
+              </p>
+              {visible.length > 0 && (
+                <SelectAllNone
+                  label={filtered ? "Select shown" : "Select"}
+                  allSelected={allSelected}
+                  noneSelected={noneSelected}
+                  onAll={() => setVisible(true)}
+                  onNone={() => setVisible(false)}
+                />
               )}
             </div>
+
+            {visible.length > 0 ? (
+              <div className="card overflow-hidden divide-y divide-surface-border">
+                {visible.map((pref) => {
+                  const isOn = selected.has(pref.name);
+                  return (
+                    <button
+                      key={pref.name}
+                      type="button"
+                      role="switch"
+                      aria-checked={isOn ? "true" : "false"}
+                      aria-label={pref.name}
+                      title={`${pref.name} = ${pref.value}`}
+                      className="px-3 py-1.5 flex items-center gap-3 w-full text-left
+                        hover:bg-surface-overlay transition-colors -outline-offset-2"
+                      onClick={() => toggle(pref.name)}
+                    >
+                      <div className="flex-1 min-w-0">
+                        <p className={`text-xs font-medium truncate ${isOn ? "text-white" : "text-subtle"}`}>
+                          {pref.name}
+                        </p>
+                        <p className="text-[11px] text-muted truncate font-mono">
+                          {displayValue(pref.value)}
+                        </p>
+                      </div>
+                      <div
+                        className={`w-9 h-5 rounded-full transition-colors duration-200 shrink-0
+                          ${isOn ? "bg-accent" : "bg-surface-border"}`}
+                      >
+                        <span className={isOn ? "toggle-sm-thumb-on" : "toggle-sm-thumb-off"} />
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className="text-xs text-muted text-center py-6">
+                No pref matches “{filter}”.
+              </p>
+            )}
           </>
         )}
       </div>
-
-      {/* Footer */}
-      {!loading && prefs && prefs.length > 0 && (
-        <div className="p-4 border-t border-surface-border flex flex-col gap-2">
-          {saved && (
-            <div className="flex items-center gap-2 p-2.5 bg-success/10 border border-success/20 rounded-xl text-sm text-success animate-fade-in">
-              <span>✓</span>
-              <span>Pref selection saved</span>
-            </div>
-          )}
-          {error && (
-            <div className="p-2.5 bg-danger/10 border border-danger/20 rounded-xl text-sm text-danger">
-              {error}
-            </div>
-          )}
-          <button
-            type="button"
-            onClick={handleSave}
-            disabled={saving}
-            className="btn-primary w-full"
-          >
-            {saving ? (
-              <>
-                <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                Saving…
-              </>
-            ) : (
-              "Save selection"
-            )}
-          </button>
-          <p className="text-xs text-muted text-center">
-            Changes take effect on the next backup.
-          </p>
-        </div>
-      )}
     </div>
   );
 }

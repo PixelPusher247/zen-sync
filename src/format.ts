@@ -6,19 +6,37 @@ export function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** "9 Nov, 17:47"; the year is added when it isn't the current one. */
 export function formatDate(iso: string | null): string {
   if (!iso) return "Never";
-  try {
-    const d = new Date(iso);
-    return d.toLocaleString(undefined, {
-      month: "short",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  } catch {
-    return iso;
-  }
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString(undefined, {
+    year: d.getFullYear() === new Date().getFullYear() ? undefined : "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+/** "3 hours ago" for the last week, the plain date beyond that. */
+export function formatRelative(iso: string | null): string {
+  if (!iso) return "Never";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const minutes = Math.round((Date.now() - d.getTime()) / 60_000);
+  if (minutes < 1) return "Just now";
+  const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+  const hours = Math.round(minutes / 60);
+  const days = Math.round(hours / 24);
+  let text: string;
+  if (minutes < 60) text = rtf.format(-minutes, "minute");
+  else if (hours < 24) text = rtf.format(-hours, "hour");
+  else if (days <= 7) text = rtf.format(-days, "day");
+  else return formatDate(iso);
+  // "yesterday" stands alone in the UI, so it starts with a capital.
+  return text.charAt(0).toLocaleUpperCase() + text.slice(1);
 }
 
 export function hasExtensionData(o: SyncOptions): boolean {

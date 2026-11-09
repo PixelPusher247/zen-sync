@@ -18,18 +18,19 @@ export default {
         success: "#22c55e",
         warning: "#f59e0b",
         danger: "#ef4444",
-        muted: "#6b7280",
+        // 5:1 on surface-raised; the old #6b7280 was 3.7:1, below WCAG AA for small text.
+        muted: "#808897",
         subtle: "#9ca3af",
       },
       fontFamily: {
         sans: [
-          "Inter",
+          "Inter Variable",
           "-apple-system",
           "BlinkMacSystemFont",
           "Segoe UI",
           "sans-serif",
         ],
-        mono: ["JetBrains Mono", "Fira Code", "monospace"],
+        mono: ["Cascadia Mono", "Consolas", "monospace"],
       },
       borderRadius: {
         xl: "0.875rem",

@@ -9,6 +9,11 @@ const STATE_FILE: &str = "state.json";
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct LocalState {
     pub machine_name: String,
+    /// Id this device's snapshots are filed under on GitHub. Unset while the
+    /// id still follows the name; frozen when a device that has backups is
+    /// renamed, so its earlier snapshots stay with it.
+    #[serde(default)]
+    pub machine_id: Option<String>,
     pub last_backup_at: Option<String>,
     pub snapshot_count: u8,
     pub autostart_enabled: bool,
@@ -28,6 +33,7 @@ impl Default for LocalState {
     fn default() -> Self {
         Self {
             machine_name: default_machine_name(),
+            machine_id: None,
             last_backup_at: None,
             snapshot_count: 3,
             autostart_enabled: false,
@@ -83,6 +89,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let orig = LocalState {
             machine_name: "Test PC".into(),
+            machine_id: Some("old-name".into()),
             last_backup_at: Some("2026-01-01T00:00:00Z".into()),
             snapshot_count: 5,
             autostart_enabled: true,
@@ -109,6 +116,8 @@ mod tests {
         std::fs::write(dir.path().join("state.json"), json).unwrap();
         let s = LocalState::load(dir.path());
         assert_eq!(s.machine_name, "PC");
+        // No stored id: it keeps following the name, as before.
+        assert_eq!(s.machine_id, None);
         assert!(s.extension_overrides.is_empty());
         assert_eq!(s.sync_options, SyncOptions::default());
     }

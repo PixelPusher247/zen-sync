@@ -11,6 +11,8 @@ export interface AppStatus {
   connected: boolean;
   username: string | null;
   machineName: string;
+  /** Id this device's snapshots are stored under; matches SnapshotInfo.machineId. */
+  machineId?: string;
   lastBackupAt: string | null;
   snapshotCount: number;
   autostartEnabled: boolean;

@@ -16,6 +16,8 @@ export interface ConfirmOptions {
   confirmLabel?: string;
   /** Style the confirm button as destructive. */
   danger?: boolean;
+  /** Focus Cancel first without the destructive styling, so Enter doesn't confirm. */
+  cautious?: boolean;
 }
 
 type Confirm = (options: ConfirmOptions) => Promise<boolean>;
@@ -66,6 +68,7 @@ function ConfirmDialog({
   message,
   confirmLabel = "Continue",
   danger = false,
+  cautious = false,
   onClose,
 }: ConfirmOptions & { onClose: (ok: boolean) => void }) {
   const titleId = useId();
@@ -76,8 +79,8 @@ function ConfirmDialog({
 
   useEffect(() => {
     // Destructive actions shouldn't be one Enter press away.
-    (danger ? cancelRef : confirmRef).current?.focus();
-  }, [danger]);
+    (danger || cautious ? cancelRef : confirmRef).current?.focus();
+  }, [danger, cautious]);
 
   function handleKeyDown(e: KeyboardEvent) {
     if (e.key === "Escape") {

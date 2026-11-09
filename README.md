@@ -51,7 +51,7 @@ Unlike [Zync](https://github.com/PixelPusher247/zync), there are no background d
 - **Snapshot history** — keeps the last N snapshots per device (default 3, configurable 1–10); restore any of them from the History screen
 - **Cross-device restore** — snapshots from all your devices appear in the History screen; you can restore any device's backup onto any other device
 - **Auto-updater** — in-app update banner when a new version is released
-- **Tray icon** — runs in the system tray; autostart disabled by default, toggleable from the tray or Settings
+- **Launch at login** — off by default, toggleable in Settings
 
 ---
 

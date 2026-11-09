@@ -34,8 +34,13 @@ impl AppState {
         }
     }
 
+    /// The id this device's snapshots are filed under: the one frozen by a
+    /// rename if there is one, otherwise derived from the current name.
     fn machine_id(&self) -> String {
-        // Stable identifier derived from machine name (URL-safe, lowercase)
+        if let Some(id) = &self.local_state.machine_id {
+            return id.clone();
+        }
+        // URL-safe, lowercase form of the machine name
         self.local_state
             .machine_name
             .to_lowercase()
@@ -267,6 +272,8 @@ struct AppStatusPayload {
     connected: bool,
     username: Option<String>,
     machine_name: String,
+    /// The id this device's snapshots are filed under, so the UI can mark them.
+    machine_id: String,
     last_backup_at: Option<String>,
     snapshot_count: u8,
     autostart_enabled: bool,
@@ -299,6 +306,7 @@ fn get_status_cmd(
             .as_ref()
             .map(|c| c.username.clone()),
         machine_name: s.local_state.machine_name.clone(),
+        machine_id: s.machine_id(),
         last_backup_at: s.local_state.last_backup_at.clone(),
         snapshot_count: s.local_state.snapshot_count,
         autostart_enabled,
@@ -471,6 +479,12 @@ fn set_machine_name_cmd(
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<(), String> {
     let mut s = state.lock().unwrap();
+    // Snapshots are filed under an id derived from the name. Once this device
+    // has backups, keep that id through the rename so they stay with it.
+    if s.local_state.machine_id.is_none() && s.local_state.last_backup_at.is_some() {
+        let id = s.machine_id();
+        s.local_state.machine_id = Some(id);
+    }
     s.local_state.machine_name = name;
     let config_dir = s.config_dir.clone();
     s.local_state.save(&config_dir)
@@ -675,11 +689,12 @@ async fn install_update(
             .map_err(|e| format!("Failed to open browser: {e}"));
     }
 
+    // Cloned rather than taken, so a failed download can be retried.
     let update = store
         .update
         .lock()
         .await
-        .take()
+        .clone()
         .ok_or("No pending update")?;
     update
         .download_and_install(|_chunk, _total| {}, || {})

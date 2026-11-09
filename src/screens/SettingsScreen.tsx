@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, type CSSProperties } from "react";
 import { bridge } from "../bridge";
 import { hasExtensionData } from "../format";
 import type { AppStatus, Screen, SyncOptions } from "../types";
@@ -11,15 +11,54 @@ interface Props {
   onNavigate: (s: Screen) => void;
 }
 
-const SYNC_ITEMS: { key: keyof SyncOptions; label: string; description: string }[] = [
+interface SyncItem {
+  key: keyof SyncOptions;
+  label: string;
+  description: string;
+}
+
+const MOD_ITEMS: SyncItem[] = [
   { key: "sineMods", label: "Sine mods", description: "Installed mods and their files" },
   { key: "modSettings", label: "Mod settings", description: "Values you set for mods and Sine" },
+];
+
+const EXTENSION_ITEMS: SyncItem[] = [
   { key: "extensionStorage", label: "Extension data", description: "What extensions keep in local storage" },
   { key: "extensionPermissions", label: "Extension permissions", description: "Optional permissions you granted" },
   { key: "extensionShortcuts", label: "Extension shortcuts", description: "Custom keyboard shortcuts" },
+];
+
+const ZEN_ITEMS: SyncItem[] = [
   { key: "zenShortcuts", label: "Zen shortcuts", description: "Workspace, compact mode and other Zen keys" },
   { key: "aboutConfig", label: "about:config prefs", description: "Settings you changed in about:config" },
 ];
+
+const MIN_SNAPSHOTS = 1;
+const MAX_SNAPSHOTS = 10;
+
+/** "6 of 7 selected", or nothing while the count is unknown. */
+interface Count {
+  selected: number;
+  total: number;
+}
+
+/** Link to a picker, placed right under the switches it belongs to. */
+function PickerLink({ label, count, onClick }: { label: string; count: Count | null; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="flex items-center justify-between gap-3 px-3 py-2 rounded-xl bg-surface-overlay
+                 border border-surface-border hover:border-accent-muted transition-colors group text-left"
+    >
+      <span className="text-xs font-medium text-white">{label}</span>
+      <span className="flex items-center gap-2 text-xs text-muted">
+        {count && `${count.selected} of ${count.total} selected`}
+        <span className="group-hover:text-accent transition-colors" aria-hidden="true">›</span>
+      </span>
+    </button>
+  );
+}
 
 export default function SettingsScreen({ status, onStatusChange, onNavigate }: Props) {
   const confirm = useConfirm();
@@ -31,15 +70,35 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
   const [machineNameSaved, setMachineNameSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [disconnecting, setDisconnecting] = useState(false);
+  const [version, setVersion] = useState<string | null>(null);
+  const [extensionCount, setExtensionCount] = useState<Count | null>(null);
+  const [prefCount, setPrefCount] = useState<Count | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Shown next to the picker links; the links work without them.
+  useEffect(() => {
+    bridge.getVersion().then(setVersion).catch(() => {});
+    bridge
+      .getExtensions()
+      .then((list) => setExtensionCount({ selected: list.filter((e) => e.synced).length, total: list.length }))
+      .catch(() => {});
+    bridge
+      .getPrefs()
+      .then((list) => setPrefCount({ selected: list.filter((p) => p.synced).length, total: list.length }))
+      .catch(() => {});
+  }, []);
+
+  const nameEmpty = machineName.trim() === "";
 
   function handleMachineNameChange(value: string) {
     setMachineName(value);
     setMachineNameSaved(false);
     if (debounceRef.current) clearTimeout(debounceRef.current);
+    // Backups are filed under the name, so an empty one is never saved.
+    if (value.trim() === "") return;
     debounceRef.current = setTimeout(async () => {
       try {
-        await bridge.setMachineName(value);
+        await bridge.setMachineName(value.trim());
         const s = await bridge.getStatus();
         onStatusChange(s);
         setMachineNameSaved(true);
@@ -114,10 +173,25 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
     }
   }
 
+  function renderSwitches(items: SyncItem[]) {
+    return items.map((item) => (
+      <Switch
+        key={item.key}
+        label={item.label}
+        description={item.description}
+        checked={syncOptions[item.key]}
+        onChange={(value) => handleSyncOptionChange(item.key, value)}
+      />
+    ));
+  }
+
+  const sliderFill = ((snapshotCount - MIN_SNAPSHOTS) / (MAX_SNAPSHOTS - MIN_SNAPSHOTS)) * 100;
+
   return (
     <div className="p-5 flex flex-col gap-5 animate-fade-in">
       <div>
         <h2 className="text-sm font-semibold text-white">Settings</h2>
+        <p className="text-xs text-muted mt-0.5">Changes are saved as you make them.</p>
       </div>
 
       {/* Device */}
@@ -133,7 +207,12 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
               type="text"
               value={machineName}
               onChange={(e) => handleMachineNameChange(e.target.value)}
+              onBlur={() => {
+                if (nameEmpty) setMachineName(status.machineName);
+              }}
               placeholder="e.g. Work Laptop"
+              aria-invalid={nameEmpty ? "true" : undefined}
+              aria-describedby="machine-name-hint"
               className="input w-full pr-8"
             />
             {machineNameSaved && (
@@ -142,8 +221,10 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
               </span>
             )}
           </div>
-          <p className="text-xs text-muted">
-            Used to label your backups. Each device keeps its own name.
+          <p id="machine-name-hint" className={`text-xs ${nameEmpty ? "text-warning" : "text-muted"}`}>
+            {nameEmpty
+              ? `The name can't be empty. Still using “${status.machineName}”.`
+              : "Used to label your backups. Each device keeps its own name."}
           </p>
         </div>
       </div>
@@ -159,18 +240,19 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
             <input
               id="snapshot-count"
               type="range"
-              min={1}
-              max={10}
+              min={MIN_SNAPSHOTS}
+              max={MAX_SNAPSHOTS}
               value={snapshotCount}
               onChange={(e) => handleSnapshotCountChange(Number(e.target.value))}
-              className="flex-1 accent-accent"
+              style={{ "--fill": `${sliderFill}%` } as CSSProperties}
+              className="slider flex-1"
             />
             <span className="w-6 text-center text-sm font-semibold text-white">
               {snapshotCount}
             </span>
           </div>
           <p className="text-xs text-muted">
-            Older snapshots are automatically removed.
+            Older snapshots are removed after each backup.
           </p>
         </div>
       </div>
@@ -183,42 +265,28 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
             Applies to backups and restores on this device.
           </p>
         </div>
-        {SYNC_ITEMS.map((item) => (
-          <Switch
-            key={item.key}
-            label={item.label}
-            description={item.description}
-            checked={syncOptions[item.key]}
-            onChange={(value) => handleSyncOptionChange(item.key, value)}
-          />
-        ))}
+
+        {renderSwitches(MOD_ITEMS)}
+
         <div className="divider" />
-        <button
-          type="button"
-          onClick={() => onNavigate("extensions")}
-          disabled={!hasExtensionData(syncOptions)}
-          className="flex items-center justify-between -mx-4 px-4 py-2 rounded-xl
-                     hover:bg-surface-overlay transition-colors group
-                     disabled:opacity-40 disabled:hover:bg-transparent"
-        >
-          <span className="text-sm text-white">Choose extensions</span>
-          <span className="text-muted text-xs group-hover:text-accent transition-colors">
-            ›
-          </span>
-        </button>
-        <button
-          type="button"
-          onClick={() => onNavigate("prefs")}
-          disabled={!syncOptions.aboutConfig}
-          className="flex items-center justify-between -mx-4 px-4 py-2 rounded-xl
-                     hover:bg-surface-overlay transition-colors group
-                     disabled:opacity-40 disabled:hover:bg-transparent"
-        >
-          <span className="text-sm text-white">Choose prefs</span>
-          <span className="text-muted text-xs group-hover:text-accent transition-colors">
-            ›
-          </span>
-        </button>
+        {renderSwitches(EXTENSION_ITEMS)}
+        {hasExtensionData(syncOptions) && (
+          <PickerLink
+            label="Choose extensions"
+            count={extensionCount}
+            onClick={() => onNavigate("extensions")}
+          />
+        )}
+
+        <div className="divider" />
+        {renderSwitches(ZEN_ITEMS)}
+        {syncOptions.aboutConfig && (
+          <PickerLink
+            label="Choose prefs"
+            count={prefCount}
+            onClick={() => onNavigate("prefs")}
+          />
+        )}
       </div>
 
       {/* Startup */}
@@ -227,18 +295,12 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
         <div className="mt-1">
           <Switch
             label="Launch at login"
-            description="Start minimized to the system tray when you log in."
+            description="Open Zen Sync when you sign in to Windows."
             checked={autostart}
             onChange={handleAutostartToggle}
           />
         </div>
       </div>
-
-      {error && (
-        <div className="p-3 bg-danger/10 border border-danger/20 rounded-xl text-sm text-danger animate-fade-in">
-          {error}
-        </div>
-      )}
 
       {/* Debug / account */}
       <div className="flex flex-col gap-2">
@@ -258,7 +320,27 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
         >
           {disconnecting ? "Disconnecting…" : "Disconnect GitHub"}
         </button>
+        {version && (
+          <p className="text-xs text-muted text-center mt-1 select-text">Zen Sync {version}</p>
+        )}
       </div>
+
+      {/* Sticks to the bottom edge so it is seen wherever the page is scrolled. */}
+      {error && (
+        <div
+          role="alert"
+          className="sticky bottom-3 p-3 bg-surface-raised border border-danger/40 rounded-xl text-sm text-danger shadow-2xl animate-fade-in"
+        >
+          <p className="select-text break-words">{error}</p>
+          <button
+            type="button"
+            onClick={() => setError(null)}
+            className="mt-2 text-xs underline opacity-80 hover:opacity-100"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
     </div>
   );
 }

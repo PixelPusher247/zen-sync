@@ -2,7 +2,8 @@ import { useState, useEffect, useCallback } from "react";
 import { bridge } from "../bridge";
 import { formatBytes } from "../format";
 import type { ExtensionWithSelection } from "../types";
-import { CloseButton } from "../components/WindowControls";
+import PickerHeader, { SelectAllNone } from "../components/PickerHeader";
+import { useAutosave } from "../hooks/useAutosave";
 
 interface Props {
   onBack: () => void;
@@ -11,23 +12,20 @@ interface Props {
 export default function ExtensionsScreen({ onBack }: Props) {
   const [extensions, setExtensions] = useState<ExtensionWithSelection[] | null>(null);
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  // Local toggle state — key: extension id, value: synced
-  const [toggles, setToggles] = useState<Record<string, boolean>>({});
+  const [loadError, setLoadError] = useState<string | null>(null);
+  // Ids of the extensions whose data is backed up.
+  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
+  const autosave = useAutosave((ids: string[]) => bridge.setExtensionSelection(ids));
 
   const load = useCallback(async () => {
+    setLoading(true);
+    setLoadError(null);
     try {
       const list = await bridge.getExtensions();
       setExtensions(list);
-      const initial: Record<string, boolean> = {};
-      for (const ext of list) {
-        initial[ext.id] = ext.synced;
-      }
-      setToggles(initial);
+      setSelected(new Set(list.filter((e) => e.synced).map((e) => e.id)));
     } catch (e) {
-      setError(String(e));
+      setLoadError(String(e));
     } finally {
       setLoading(false);
     }
@@ -37,129 +35,108 @@ export default function ExtensionsScreen({ onBack }: Props) {
     load();
   }, [load]);
 
+  /** Every change is saved straight away, like the switches in Settings. */
+  function apply(next: Set<string>) {
+    setSelected(next);
+    autosave.push([...next]);
+  }
+
   function toggle(id: string) {
-    setToggles((prev) => ({ ...prev, [id]: !prev[id] }));
+    const next = new Set(selected);
+    if (!next.delete(id)) next.add(id);
+    apply(next);
   }
 
-  function selectAll() {
-    setToggles((prev) => Object.fromEntries(Object.keys(prev).map((k) => [k, true])));
-  }
-
-  function selectNone() {
-    setToggles((prev) => Object.fromEntries(Object.keys(prev).map((k) => [k, false])));
-  }
-
-  const allSelected = extensions?.every((e) => toggles[e.id] ?? true) ?? false;
-  const noneSelected = extensions?.every((e) => !(toggles[e.id] ?? true)) ?? false;
-
-  async function handleSave() {
-    setSaving(true);
-    setError(null);
-    try {
-      const selectedIds = extensions
-        ?.filter((e) => toggles[e.id] ?? true)
-        .map((e) => e.id) ?? [];
-      await bridge.setExtensionSelection(selectedIds);
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2500);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setSaving(false);
-    }
-  }
+  const count = extensions?.length ?? 0;
 
   return (
     <div className="flex flex-col h-full animate-fade-in">
-      {/* Header */}
-      <div
-        data-tauri-drag-region="deep"
-        className="flex items-center gap-3 pl-5 pr-3 py-3.5 border-b border-surface-border bg-surface-raised"
-      >
-        <button
-          type="button"
-          onClick={onBack}
-          className="text-muted hover:text-white transition-colors text-sm"
-        >
-          ← Back
-        </button>
-        <div className="flex-1">
-          <h2 className="text-sm font-semibold text-white">Extensions</h2>
-          <p className="text-xs text-muted">
-            Choose which extensions' local data to include in backups
-          </p>
-        </div>
-        {extensions && extensions.length > 0 && (
-          <div className="flex items-center gap-1">
-            <button
-              type="button"
-              onClick={selectAll}
-              disabled={allSelected}
-              className="text-xs text-accent hover:text-accent-hover disabled:opacity-40 transition-colors"
-            >
-              All
-            </button>
-            <span className="text-muted text-xs">/</span>
-            <button
-              type="button"
-              onClick={selectNone}
-              disabled={noneSelected}
-              className="text-xs text-muted hover:text-white disabled:opacity-40 transition-colors"
-            >
-              None
-            </button>
-          </div>
-        )}
-        <CloseButton />
-      </div>
+      <PickerHeader
+        title="Extensions"
+        subtitle="Whose data to back up and restore"
+        saveState={autosave.state}
+        onBack={onBack}
+      />
 
-      {/* Content */}
-      <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-3">
+      <div className="flex-1 min-h-0 overflow-y-auto p-4 flex flex-col gap-3">
         {loading && (
-          <div className="flex items-center justify-center py-10">
+          <div className="flex items-center justify-center py-10" role="status" aria-label="Loading extensions">
             <div className="w-5 h-5 border-2 border-accent border-t-transparent rounded-full animate-spin" />
           </div>
         )}
 
-        {error && (
-          <div className="p-3 bg-danger/10 border border-danger/20 rounded-xl text-sm text-danger">
-            {error}
+        {loadError && (
+          <div role="alert" className="p-3 bg-danger/10 border border-danger/20 rounded-xl text-sm text-danger">
+            <p className="select-text break-words">{loadError}</p>
+            <button type="button" onClick={load} className="mt-2 text-xs underline opacity-80 hover:opacity-100">
+              Try again
+            </button>
           </div>
         )}
 
-        {!loading && extensions?.length === 0 && (
+        {autosave.error && (
+          <div role="alert" className="p-3 bg-danger/10 border border-danger/20 rounded-xl text-sm text-danger">
+            <p className="font-medium">Couldn't save your selection</p>
+            <p className="text-xs mt-1 select-text break-words">{autosave.error}</p>
+            <button
+              type="button"
+              onClick={() => autosave.push([...selected])}
+              className="mt-2 text-xs underline opacity-80 hover:opacity-100"
+            >
+              Try again
+            </button>
+          </div>
+        )}
+
+        {!loading && !loadError && count === 0 && (
           <div className="card p-6 text-center">
-            <p className="text-muted text-sm">No extensions found.</p>
+            <p className="text-subtle text-sm">No extensions found.</p>
             <p className="text-muted text-xs mt-1">
               Install extensions in Zen Browser, then return here.
             </p>
           </div>
         )}
 
-        {!loading && extensions && extensions.length > 0 && (
+        {!loading && extensions && count > 0 && (
           <>
             <p className="text-xs text-muted">
-              {Object.values(toggles).filter(Boolean).length} of{" "}
-              {extensions.length} extensions will be backed up: their local
-              storage, granted permissions and custom shortcuts. Password
-              managers are off by default because their data includes your
-              account session.
+              Covers each extension's local storage, granted permissions and
+              custom shortcuts. Password managers are off by default because
+              their data includes your account session.
             </p>
+
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-xs text-subtle font-medium">
+                {selected.size} of {count} selected
+              </p>
+              <SelectAllNone
+                label="Select"
+                allSelected={selected.size === count}
+                noneSelected={selected.size === 0}
+                onAll={() => apply(new Set(extensions.map((e) => e.id)))}
+                onNone={() => apply(new Set())}
+              />
+            </div>
 
             <div className="flex flex-col gap-1.5">
               {extensions.map((ext) => {
-                const isOn = toggles[ext.id] ?? true;
+                const isOn = selected.has(ext.id);
                 return (
                   <button
                     key={ext.id}
                     type="button"
-                    className={`card px-3.5 py-2.5 flex items-center gap-3 w-full text-left
-                      hover:border-surface-overlay transition-colors
-                      ${isOn ? "" : "opacity-50"}`}
+                    role="switch"
+                    aria-checked={isOn ? "true" : "false"}
+                    title={ext.name}
+                    className="card px-3.5 py-2.5 flex items-center gap-3 w-full text-left
+                      hover:border-accent-muted transition-colors"
                     onClick={() => toggle(ext.id)}
                   >
                     {/* Icon */}
-                    <div className="w-8 h-8 rounded-lg bg-surface-overlay flex items-center justify-center shrink-0 overflow-hidden">
+                    <div
+                      className={`w-8 h-8 rounded-lg bg-surface-overlay flex items-center justify-center shrink-0 overflow-hidden
+                        ${isOn ? "" : "opacity-50 grayscale"}`}
+                    >
                       {ext.iconUrl ? (
                         <img
                           src={ext.iconUrl}
@@ -179,7 +156,7 @@ export default function ExtensionsScreen({ onBack }: Props) {
                     {/* Info */}
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 min-w-0">
-                        <p className="text-sm font-medium text-white truncate">
+                        <p className={`text-sm font-medium truncate ${isOn ? "text-white" : "text-subtle"}`}>
                           {ext.name}
                         </p>
                         {ext.passwordManager && (
@@ -189,9 +166,7 @@ export default function ExtensionsScreen({ onBack }: Props) {
                       <p className="text-xs text-muted truncate">
                         v{ext.version} ·{" "}
                         {ext.storageBytes > 0 ? formatBytes(ext.storageBytes) : "no local storage"}
-                        {!ext.enabled && (
-                          <span className="ml-2 opacity-60">(disabled)</span>
-                        )}
+                        {!ext.enabled && " · disabled in Zen"}
                       </p>
                     </div>
 
@@ -209,41 +184,6 @@ export default function ExtensionsScreen({ onBack }: Props) {
           </>
         )}
       </div>
-
-      {/* Footer */}
-      {!loading && extensions && extensions.length > 0 && (
-        <div className="p-4 border-t border-surface-border flex flex-col gap-2">
-          {saved && (
-            <div className="flex items-center gap-2 p-2.5 bg-success/10 border border-success/20 rounded-xl text-sm text-success animate-fade-in">
-              <span>✓</span>
-              <span>Extension selection saved</span>
-            </div>
-          )}
-          {error && (
-            <div className="p-2.5 bg-danger/10 border border-danger/20 rounded-xl text-sm text-danger">
-              {error}
-            </div>
-          )}
-          <button
-            type="button"
-            onClick={handleSave}
-            disabled={saving}
-            className="btn-primary w-full"
-          >
-            {saving ? (
-              <>
-                <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                Saving…
-              </>
-            ) : (
-              "Save selection"
-            )}
-          </button>
-          <p className="text-xs text-muted text-center">
-            Changes take effect on the next backup.
-          </p>
-        </div>
-      )}
     </div>
   );
 }
