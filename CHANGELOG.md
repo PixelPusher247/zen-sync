@@ -5,6 +5,71 @@ Everything that changed in Zen Sync, newest first.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-11-09
+
+A pass over the whole interface, plus three fixes it turned up.
+
+### Added
+
+- **Status strip.** Progress and the result of a backup or restore now show at
+  the top of every screen. Failures offer **Show logs**, and a finished restore
+  tells you Zen can be opened again.
+- **"This device" in History.** Snapshots made on the device you are using are
+  marked, and only the newest snapshot overall is called *Latest*. History also
+  has a **Refresh** link.
+- **App version** at the bottom of Settings.
+- **Cancel** while waiting for the GitHub sign-in on first run.
+
+### Changed
+
+- **Choose extensions** and **Choose prefs** save each change as you make it,
+  like the switches in Settings. The Save button is gone.
+- The links to those two screens sit directly under the switches they belong
+  to, show how many items are selected, and only appear while the switch is on.
+- The `about:config` list is one compact list instead of a card per pref.
+  *Select all / none* sits beside the count and acts on the filtered rows when a
+  filter is active.
+- A backup or restore keeps running, and keeps its result, when you switch
+  screens. A second one can't be started until it finishes.
+- The restore confirmation focuses **Cancel**, so pressing Enter no longer
+  starts a restore.
+- Last backup reads as "Yesterday" or "3 hours ago"; hover for the exact time.
+  Dates in another year show the year.
+- The Inter font ships with the app instead of being fetched from Google Fonts,
+  so drawing the window makes no network request.
+- Keyboard focus is visible everywhere, switches can be toggled by clicking
+  their label, and secondary text has more contrast.
+- Error messages can be selected and copied.
+- An empty device name is no longer saved.
+
+### Fixed
+
+- **Renaming a device no longer orphans its snapshots.** Snapshots were filed
+  under an id derived from the device name, so after a rename the earlier ones
+  were left under the old name and never pruned. A device that has backups now
+  keeps its id when renamed.
+- **A failed update can be retried.** The pending update was discarded on the
+  first attempt, so **Install** failed with "No pending update" the second time.
+  Install failures are also shown in the banner instead of being logged only.
+- **An abandoned GitHub sign-in no longer waits forever.** It gives up after
+  five minutes and stops listening for the browser's reply.
+- The dashboard's "Snapshots stored" showed the *Snapshots to keep* setting, not
+  a count. It is now labelled "Snapshots kept per device".
+- History showed a bare "Error" with no way to retry when the list failed to
+  load.
+
+### Removed
+
+- Mentions of a system tray icon. The app does not have one; *Launch at login*
+  opens the window.
+
+### Notes
+
+- Snapshots already orphaned by a rename under 0.4.0 or earlier stay where they
+  are. They still appear in History under the old name and can be restored.
+- Two devices with the same name still share one set of snapshots. Give each
+  device its own name.
+
 ## [0.4.0] — 2026-09-19
 
 ### Added
@@ -167,6 +232,7 @@ private GitHub repository.
   replacing profile files the browser holds open.
 - In-app update banner, system tray icon, and autostart (off by default).
 
+[0.5.0]: https://github.com/PixelPusher247/zen-sync/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/PixelPusher247/zen-sync/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/PixelPusher247/zen-sync/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/PixelPusher247/zen-sync/compare/v0.2.1...v0.3.0
