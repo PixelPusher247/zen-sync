@@ -42,7 +42,9 @@ jobs:
 
       - name: cargo check
         working-directory: src-tauri
-        run: cargo check
+        # --locked: fail if Cargo.lock doesn't match Cargo.toml instead of
+        # quietly rewriting it.
+        run: cargo check --locked
 
       - name: cargo clippy
         working-directory: src-tauri

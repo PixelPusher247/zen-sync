@@ -192,7 +192,8 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
     if (ops.busy) return;
     const ok = await confirm({
       title: "Disconnect from GitHub?",
-      message: "Your backup repo and its snapshots are not deleted. You can reconnect at any time.",
+      message:
+        "Your backup repo and its snapshots are not deleted. You can reconnect at any time; you'll need your backup passphrase or recovery code again.",
       confirmLabel: "Disconnect",
       danger: true,
     });
@@ -330,6 +331,22 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
             onClick={() => onNavigate("prefs")}
           />
         )}
+      </div>
+
+      {/* Encryption */}
+      <div className="card p-4 flex flex-col gap-3">
+        <div>
+          <p className="section-label mb-0.5">Encryption</p>
+          <p className="text-xs text-muted">
+            Backups are encrypted with a key only your passphrase or recovery
+            code can unlock.
+          </p>
+        </div>
+        <PickerLink
+          label="Passphrase and recovery code"
+          count={null}
+          onClick={() => onNavigate("encryption")}
+        />
       </div>
 
       {/* Startup */}

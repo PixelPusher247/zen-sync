@@ -8,6 +8,8 @@ import SnapshotsScreen from "./screens/SnapshotsScreen";
 import SettingsScreen from "./screens/SettingsScreen";
 import ExtensionsScreen from "./screens/ExtensionsScreen";
 import PrefsScreen from "./screens/PrefsScreen";
+import KeyScreen from "./screens/KeyScreen";
+import EncryptionScreen from "./screens/EncryptionScreen";
 import UpdateBanner from "./components/UpdateBanner";
 import NavBar from "./components/NavBar";
 import OperationStatus from "./components/OperationStatus";
@@ -86,8 +88,13 @@ export default function App() {
     );
   }
 
+  // Connected, but this device can't encrypt or decrypt snapshots yet.
+  if (status.encryption !== "ready") {
+    return <KeyScreen status={status} onStatusChange={setStatus} />;
+  }
+
   // These screens bring their own header, with the close button in it.
-  const isFullScreen = screen === "extensions" || screen === "prefs";
+  const isFullScreen = screen === "extensions" || screen === "prefs" || screen === "encryption";
 
   return (
     <OperationsProvider status={status} onStatusChange={setStatus}>
@@ -115,6 +122,9 @@ export default function App() {
           )}
           {screen === "prefs" && (
             <PrefsScreen onBack={() => setScreen("settings")} />
+          )}
+          {screen === "encryption" && (
+            <EncryptionScreen onBack={() => setScreen("settings")} />
           )}
         </main>
       </div>

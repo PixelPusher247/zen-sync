@@ -19,6 +19,22 @@ export interface AppStatus {
   syncOptions: SyncOptions;
   /** A saved sign-in is still being restored, e.g. while the network comes up. */
   reconnecting?: boolean;
+  /**
+   * The snapshot key on this device: "needs-setup" (no passphrase chosen
+   * yet), "locked" (enter the passphrase or recovery code) or "ready".
+   */
+  encryption?: EncryptionState;
+  /** With "needs-setup": setting up deletes backups from Zen Sync 0.5 and earlier. */
+  oldBackups?: boolean;
+}
+
+export type EncryptionState = "unknown" | "needs-setup" | "locked" | "ready";
+
+export interface SetupEncryptionResult {
+  /** Shown once; the app never stores it. */
+  recoveryCode: string;
+  status: AppStatus;
+  warning: string | null;
 }
 
 /** What this device backs up and restores. */
@@ -83,4 +99,5 @@ export type Screen =
   | "snapshots"
   | "settings"
   | "extensions"
-  | "prefs";
+  | "prefs"
+  | "encryption";

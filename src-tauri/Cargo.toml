@@ -22,10 +22,12 @@ sysinfo = "0.30"
 # Profile discovery
 dirs = "5"
 
-# Crypto (AES-256-GCM + PBKDF2)
+# Crypto: AES-256-GCM for snapshots, Argon2id to derive the key that wraps
+# the snapshot key from a passphrase or recovery code. argon2 is held at 0.5,
+# whose dependencies are already in the tree.
 aes-gcm = "0.10"
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 generic-array = "0.14"
-pbkdf2 = { version = "0.12", features = ["simple"] }
 sha2 = "0.10"
 rand = "0.8"
 base64 = "0.22"

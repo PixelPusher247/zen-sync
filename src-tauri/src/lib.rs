@@ -4,6 +4,7 @@ mod ext_storage;
 mod extensions;
 mod fsutil;
 mod github;
+mod keyfile;
 mod local_state;
 pub mod logger;
 mod prefs;
@@ -25,6 +26,53 @@ struct AppState {
     config_dir: std::path::PathBuf,
     /// A saved sign-in is being restored in the background.
     reconnecting: bool,
+    encryption: Encryption,
+}
+
+/// Where this device stands with the snapshot key.
+#[derive(Clone)]
+enum Encryption {
+    /// Not connected, or not checked yet.
+    Unknown,
+    /// The repository has no key file: the first device sets a passphrase.
+    /// `old_backups`: there are backups from 0.5 or earlier, which setup
+    /// deletes because they used the old, unprotected key.
+    NeedsSetup { old_backups: bool },
+    /// The repository has a key file this device has no matching key for:
+    /// the passphrase or recovery code unlocks it.
+    Locked,
+    Ready(crypto::DataKey),
+}
+
+impl Encryption {
+    fn label(&self) -> &'static str {
+        match self {
+            Encryption::Unknown => "unknown",
+            Encryption::NeedsSetup { .. } => "needs-setup",
+            Encryption::Locked => "locked",
+            Encryption::Ready(_) => "ready",
+        }
+    }
+}
+
+/// Check the repository's key file against this device's copy of the key.
+async fn check_encryption(client: &github::GitHubClient) -> Result<Encryption, String> {
+    let Some((file, _)) = client.read_key_file().await? else {
+        return Ok(Encryption::NeedsSetup { old_backups: client.has_backups_without_key_file().await? });
+    };
+    Ok(match keyfile::load_local_key() {
+        Some(key) if key.id_hex() == file.key_id => Encryption::Ready(key),
+        _ => Encryption::Locked,
+    })
+}
+
+/// Run a CPU-heavy key derivation off the async runtime's worker threads.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|e| format!("Key derivation task failed: {e}"))?
 }
 
 /// Held for the whole of a backup or restore, so two can never run at once,
@@ -103,6 +151,7 @@ pub fn run() {
                 local_state: ls,
                 config_dir,
                 reconnecting: has_token,
+                encryption: Encryption::Unknown,
             }));
             app.manage(state.clone());
             app.manage(OperationLock(tokio::sync::Mutex::new(())));
@@ -172,6 +221,11 @@ pub fn run() {
             get_backup_summary_cmd,
             get_snapshots_cmd,
             restore_snapshot_cmd,
+            setup_encryption_cmd,
+            unlock_encryption_cmd,
+            change_passphrase_cmd,
+            new_recovery_code_cmd,
+            reset_encryption_cmd,
             set_machine_name_cmd,
             set_snapshot_count_cmd,
             set_sync_options_cmd,
@@ -194,10 +248,19 @@ pub fn run() {
 /// the user sees the app reconnecting instead of nothing.
 async fn restore_saved_sign_in(state: &Arc<Mutex<AppState>>, app: &tauri::AppHandle) {
     for attempt in 1..=RECONNECT_ATTEMPTS {
-        match github::GitHubClient::from_keychain().await {
+        let restored = match github::GitHubClient::from_keychain().await {
             Ok(Some(client)) => {
-                state.lock().unwrap().github_client = Some(Arc::new(client));
-                crate::zslog!("[app] GitHub client restored from keychain");
+                let checked = check_encryption(&client).await;
+                checked.map(|encryption| Some((client, encryption)))
+            }
+            other => other.map(|_| None),
+        };
+        match restored {
+            Ok(Some((client, encryption))) => {
+                let mut s = state.lock().unwrap();
+                s.github_client = Some(Arc::new(client));
+                s.encryption = encryption;
+                crate::zslog!("[app] GitHub client restored from keychain ({})", s.encryption.label());
                 return;
             }
             Ok(None) => {
@@ -315,6 +378,20 @@ struct AppStatusPayload {
     sync_options: bundle::SyncOptions,
     /// A saved sign-in is still being restored (e.g. waiting for the network).
     reconnecting: bool,
+    /// "unknown", "needs-setup", "locked" or "ready"; see `Encryption`.
+    encryption: &'static str,
+    /// With "needs-setup": setting up will delete backups from 0.5 or earlier.
+    old_backups: bool,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetupEncryptionResult {
+    /// Shown to the user once; never stored by the app.
+    recovery_code: String,
+    status: AppStatusPayload,
+    /// Set if removing the old backups failed after setup succeeded.
+    warning: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -349,6 +426,8 @@ fn get_status_cmd(
         autostart_enabled,
         sync_options: s.local_state.sync_options.clone(),
         reconnecting: s.reconnecting && s.github_client.is_none(),
+        encryption: s.encryption.label(),
+        old_backups: matches!(s.encryption, Encryption::NeedsSetup { old_backups: true }),
     }
 }
 
@@ -358,9 +437,11 @@ async fn connect_github_cmd(
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<AppStatusPayload, String> {
     let client = github::GitHubClient::connect(&app).await?;
+    let encryption = check_encryption(&client).await?;
     {
         let mut s = state.lock().unwrap();
         s.github_client = Some(Arc::new(client));
+        s.encryption = encryption;
     }
     Ok(get_status_cmd(app, state))
 }
@@ -370,8 +451,184 @@ fn disconnect_github_cmd(
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<(), String> {
     github::remove_stored_token()?;
-    state.lock().unwrap().github_client = None;
+    // Signing out also forgets the key: reconnecting asks for the
+    // passphrase again.
+    keyfile::forget_local_key()?;
+    let mut s = state.lock().unwrap();
+    s.github_client = None;
+    s.encryption = Encryption::Unknown;
     Ok(())
+}
+
+// ── Encryption ────────────────────────────────────────────────────────────────
+
+fn connected_client(state: &Mutex<AppState>) -> Result<Arc<github::GitHubClient>, String> {
+    state
+        .lock()
+        .unwrap()
+        .github_client
+        .clone()
+        .ok_or_else(|| "Not connected to GitHub".to_string())
+}
+
+fn ready_key(state: &Mutex<AppState>) -> Result<crypto::DataKey, String> {
+    match &state.lock().unwrap().encryption {
+        Encryption::Ready(key) => Ok(key.clone()),
+        _ => Err("Encryption isn't set up on this device yet.".into()),
+    }
+}
+
+const KEY_FILE_RACE: &str =
+    "Encryption was just set up from another device. Enter the passphrase you chose there.";
+
+/// First device: create the snapshot key, protect it with the passphrase
+/// and a new recovery code, and remove backups made with the old key.
+#[tauri::command]
+async fn setup_encryption_cmd(
+    passphrase: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    lock: tauri::State<'_, OperationLock>,
+) -> Result<SetupEncryptionResult, String> {
+    let _operation = lock.0.try_lock().map_err(|_| OPERATION_BUSY)?;
+    keyfile::check_passphrase(&passphrase)?;
+    let client = connected_client(&state)?;
+    if client.read_key_file().await?.is_some() {
+        state.lock().unwrap().encryption = Encryption::Locked;
+        return Err(KEY_FILE_RACE.into());
+    }
+
+    let key = crypto::DataKey::generate();
+    let code = keyfile::RecoveryCode::generate();
+    let recovery_code = code.display();
+    let file = {
+        let key = key.clone();
+        blocking(move || keyfile::KeyFile::create(&key, &passphrase, &code)).await?
+    };
+    // Kept locally first: if the upload then fails, the stray local copy is
+    // simply replaced next time.
+    keyfile::save_local_key(&key)?;
+    if !client.write_key_file(&file, None).await? {
+        state.lock().unwrap().encryption = Encryption::Locked;
+        return Err(KEY_FILE_RACE.into());
+    }
+    crate::zslog!("[encryption] set up, key {}", key.id_hex());
+    state.lock().unwrap().encryption = Encryption::Ready(key);
+
+    // Starting fresh: snapshots made with the old key could never be
+    // restored, and the old key must not stay readable in the repository.
+    let warning = match client.delete_all_backups(false).await {
+        Ok(()) => None,
+        Err(e) => {
+            crate::zslog!("[encryption] removing old backups failed: {e}");
+            Some(format!(
+                "Encryption is set up, but removing backups made with the old key failed: {e}"
+            ))
+        }
+    };
+    Ok(SetupEncryptionResult {
+        recovery_code,
+        status: get_status_cmd(app, state),
+        warning,
+    })
+}
+
+/// Another device: unlock the snapshot key with the passphrase or the
+/// recovery code.
+#[tauri::command]
+async fn unlock_encryption_cmd(
+    secret: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<AppStatusPayload, String> {
+    let client = connected_client(&state)?;
+    let Some((file, _)) = client.read_key_file().await? else {
+        let old_backups = client.has_backups_without_key_file().await?;
+        state.lock().unwrap().encryption = Encryption::NeedsSetup { old_backups };
+        return Err("Encryption isn't set up yet. Choose a passphrase to set it up.".into());
+    };
+    let key = blocking(move || file.unlock(&secret))
+        .await?
+        .ok_or("That passphrase or recovery code doesn't match.")?;
+    keyfile::save_local_key(&key)?;
+    state.lock().unwrap().encryption = Encryption::Ready(key);
+    Ok(get_status_cmd(app, state))
+}
+
+/// Re-wrap the key under a new passphrase, after checking the current one.
+#[tauri::command]
+async fn change_passphrase_cmd(
+    current: String,
+    new_passphrase: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    keyfile::check_passphrase(&new_passphrase)?;
+    let key = ready_key(&state)?;
+    let client = connected_client(&state)?;
+    let (file, sha) = client
+        .read_key_file()
+        .await?
+        .ok_or("The key file is missing from the backup repository.")?;
+    let updated = blocking(move || {
+        match file.unlock_with_passphrase(&current)? {
+            Some(k) if k.id_hex() == key.id_hex() => file.with_passphrase(&key, &new_passphrase),
+            Some(_) => Err("The key file changed on another device. Restart Zen Sync and try again.".into()),
+            None => Err("The current passphrase is wrong.".into()),
+        }
+    })
+    .await?;
+    if !client.write_key_file(&updated, Some(&sha)).await? {
+        return Err("The key file changed on GitHub meanwhile. Try again.".into());
+    }
+    crate::zslog!("[encryption] passphrase changed");
+    Ok(())
+}
+
+/// Replace the recovery code, after checking the passphrase. Returns the new
+/// code, which is shown once and not stored.
+#[tauri::command]
+async fn new_recovery_code_cmd(
+    passphrase: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    let key = ready_key(&state)?;
+    let client = connected_client(&state)?;
+    let (file, sha) = client
+        .read_key_file()
+        .await?
+        .ok_or("The key file is missing from the backup repository.")?;
+    let code = keyfile::RecoveryCode::generate();
+    let shown = code.display();
+    let updated = blocking(move || {
+        match file.unlock_with_passphrase(&passphrase)? {
+            Some(k) if k.id_hex() == key.id_hex() => file.with_recovery_code(&key, &code),
+            Some(_) => Err("The key file changed on another device. Restart Zen Sync and try again.".into()),
+            None => Err("The passphrase is wrong.".into()),
+        }
+    })
+    .await?;
+    if !client.write_key_file(&updated, Some(&sha)).await? {
+        return Err("The key file changed on GitHub meanwhile. Try again.".into());
+    }
+    crate::zslog!("[encryption] recovery code replaced");
+    Ok(shown)
+}
+
+/// Both passphrase and recovery code forgotten: delete every backup and the
+/// key file, so encryption can be set up again from scratch.
+#[tauri::command]
+async fn reset_encryption_cmd(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    lock: tauri::State<'_, OperationLock>,
+) -> Result<AppStatusPayload, String> {
+    let _operation = lock.0.try_lock().map_err(|_| OPERATION_BUSY)?;
+    let client = connected_client(&state)?;
+    client.delete_all_backups(true).await?;
+    keyfile::forget_local_key()?;
+    crate::zslog!("[encryption] reset: all backups and the key file deleted");
+    state.lock().unwrap().encryption = Encryption::NeedsSetup { old_backups: false };
+    Ok(get_status_cmd(app, state))
 }
 
 const OPERATION_BUSY: &str = "Another backup or restore is still running. Wait for it to finish.";
@@ -401,10 +658,11 @@ async fn backup_now_cmd(
             s.selection(),
         )
     };
+    let key = ready_key(&state)?;
 
     let app_p = app.clone();
     let pushed_at = sync::backup(
-        &client,
+        sync::Remote { client: &client, key: &key },
         &machine_name,
         &machine_id,
         max_snapshots,
@@ -509,10 +767,11 @@ async fn restore_snapshot_cmd(
         let c = s.github_client.clone().ok_or("Not connected to GitHub")?;
         (c, s.selection(), s.config_dir.join("restore-backups"))
     };
+    let key = ready_key(&state)?;
 
     let app_p = app.clone();
     let report = sync::restore(
-        &client,
+        sync::Remote { client: &client, key: &key },
         &machine_id,
         index,
         pushed_at.as_deref(),

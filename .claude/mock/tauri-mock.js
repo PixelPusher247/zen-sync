@@ -73,6 +73,14 @@
   }
 
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const currentStatus = () => ({
+    ...status,
+    connected: m.connected,
+    reconnecting: !m.connected && !!m.reconnecting,
+    encryption: m.connected ? m.encryption || "ready" : "unknown",
+    oldBackups: !!m.oldBackups,
+    syncOptions: { ...status.syncOptions },
+  });
   const listeners = [];
   let nextId = 1;
   const callbacks = {};
@@ -95,12 +103,37 @@
 
     switch (cmd) {
       case "get_status_cmd":
-        return {
-          ...status,
-          connected: m.connected,
-          reconnecting: !m.connected && !!m.reconnecting,
-          syncOptions: { ...status.syncOptions },
-        };
+        return currentStatus();
+      case "setup_encryption_cmd":
+        await wait(900);
+        if ([...args.passphrase].length < 10) throw "Use at least 10 characters for the passphrase.";
+        m.encryption = "ready";
+        m.passphrase = args.passphrase;
+        m.save();
+        return { recoveryCode: "7KQF2-M9XHC-RV4TN-0PZWA-G3BDE", status: currentStatus(), warning: null };
+      case "unlock_encryption_cmd":
+        await wait(700);
+        if (args.secret !== (m.passphrase || "correct horse battery") && args.secret.replace(/[- ]/g, "").toUpperCase() !== "7KQF2M9XHCRV4TN0PZWAG3BDE") {
+          throw "That passphrase or recovery code doesn't match.";
+        }
+        m.encryption = "ready";
+        m.save();
+        return currentStatus();
+      case "change_passphrase_cmd":
+        await wait(700);
+        if (args.current !== (m.passphrase || "correct horse battery")) throw "The current passphrase is wrong.";
+        m.passphrase = args.newPassphrase;
+        m.save();
+        return;
+      case "new_recovery_code_cmd":
+        await wait(700);
+        if (args.passphrase !== (m.passphrase || "correct horse battery")) throw "The passphrase is wrong.";
+        return "W2C9P-0QJ7M-HX4RT-KZ8VN-B1EYD";
+      case "reset_encryption_cmd":
+        m.encryption = "needs-setup";
+        m.oldBackups = false;
+        m.save();
+        return currentStatus();
       case "connect_github_cmd":
         await wait(1200);
         m.connected = true;

@@ -5,6 +5,41 @@ Everything that changed in Zen Sync, newest first.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-11-10
+
+### Added
+
+- **Backup passphrase and recovery code.** The key that encrypts your
+  snapshots is no longer stored readable in your backup repository. On the
+  first device you choose a passphrase and get a recovery code; the key is
+  stored only locked with those two, so GitHub, a leaked GitHub token, or
+  anyone else who can read the repository can't decrypt your backups. Other
+  devices ask once for the passphrase or the recovery code.
+- **Settings → Encryption** to change the passphrase or make a new recovery
+  code. Neither re-encrypts your backups.
+- **Start over**, for when both the passphrase and the recovery code are
+  lost: deletes every backup so encryption can be set up again.
+
+### Changed
+
+- Snapshots carry a small header naming the key they were made with, so a
+  snapshot from an older version or another key is reported as such instead of
+  as "wrong key or corrupted bundle".
+- Disconnecting GitHub also removes the key from this device.
+
+### Removed
+
+- The unprotected `encryption-key.b64` in the backup repository, and the
+  PBKDF2 step it went through, which added nothing for a random key.
+
+### Upgrading
+
+- **Your existing backups are deleted** when you set the passphrase: they were
+  made with the old key, which anyone with access to the repository could
+  read. Update every device to this version, set the passphrase on one of
+  them, enter it on the others, and back up again on each.
+- A device still on 0.5 can't restore snapshots made by this version.
+
 ## [0.5.2] — 2026-11-10
 
 Fixes from a review of the whole app.
@@ -309,6 +344,7 @@ private GitHub repository.
   replacing profile files the browser holds open.
 - In-app update banner, system tray icon, and autostart (off by default).
 
+[0.6.0]: https://github.com/PixelPusher247/zen-sync/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/PixelPusher247/zen-sync/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/PixelPusher247/zen-sync/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/PixelPusher247/zen-sync/compare/v0.4.0...v0.5.0

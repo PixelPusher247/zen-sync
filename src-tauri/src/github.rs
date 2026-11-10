@@ -1,9 +1,10 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 
+use crate::keyfile::{KeyFile, KEY_FILE_PATH};
+
 const KEYCHAIN_SERVICE: &str = "zen-sync";
 const KEYCHAIN_ACCOUNT: &str = "github";
-const KEYCHAIN_ENC_ACCOUNT: &str = "encryption-key";
 
 // Set via environment at build time. See README for GitHub OAuth App setup.
 pub const GITHUB_CLIENT_ID: &str = env!("GITHUB_CLIENT_ID");
@@ -11,7 +12,9 @@ const GITHUB_CLIENT_SECRET: &str = env!("GITHUB_CLIENT_SECRET");
 
 pub const REPO_NAME: &str = "zen-sync-backup";
 const RELEASE_TAG: &str = "storage";
-const ENCRYPTION_KEY_ASSET: &str = "encryption-key.b64";
+/// The unwrapped key zen-sync 0.5 and earlier uploaded. Deleted when
+/// encryption is set up.
+const OLD_KEY_ASSET: &str = "encryption-key.b64";
 const METADATA_PATH: &str = "metadata-v2.json";
 const SNAPSHOT_ASSET_PREFIX: &str = "mods-";
 /// Full-profile snapshots written by zen-sync ≤ 0.1.x.
@@ -131,7 +134,6 @@ pub struct GitHubClient {
     pub user_id: u64,
     pub username: String,
     pub release_id: u64,
-    pub encryption_key: [u8; 32],
     pub http: reqwest::Client,
 }
 
@@ -158,12 +160,10 @@ fn save_token(token: &str, user_id: u64, username: &str) -> Result<(), String> {
 }
 
 pub fn remove_stored_token() -> Result<(), String> {
-    for account in [KEYCHAIN_ACCOUNT, KEYCHAIN_ENC_ACCOUNT] {
-        if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, account) {
-            match entry.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => {}
-                Err(e) => return Err(format!("Failed to remove credentials: {e}")),
-            }
+    if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(e) => return Err(format!("Failed to remove credentials: {e}")),
         }
     }
     Ok(())
@@ -178,27 +178,6 @@ fn load_token_parts() -> Option<(String, u64, String)> {
     Some((creds.token, creds.user_id, creds.username))
 }
 
-fn save_encryption_key(key: &[u8; 32]) -> Result<(), String> {
-    let b64 = BASE64.encode(key);
-    keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ENC_ACCOUNT)
-        .map_err(|e| format!("Keychain error: {e}"))?
-        .set_password(&b64)
-        .map_err(|e| format!("Failed to save encryption key: {e}"))
-}
-
-fn load_encryption_key() -> Option<[u8; 32]> {
-    let b64 = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ENC_ACCOUNT)
-        .ok()?
-        .get_password()
-        .ok()?;
-    let bytes = BASE64.decode(b64.trim()).ok()?;
-    if bytes.len() != 32 {
-        return None;
-    }
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&bytes);
-    Some(key)
-}
 
 // ── OAuth ─────────────────────────────────────────────────────────────────────
 
@@ -497,54 +476,6 @@ impl GitHubClient {
         }
     }
 
-    async fn get_or_create_encryption_key(&self) -> Result<[u8; 32], String> {
-        // Try local keychain first (avoids a network round-trip on reconnect)
-        if let Some(key) = load_encryption_key() {
-            return Ok(key);
-        }
-
-        // Try downloading from the repo
-        if let Some(asset_id) = self.get_asset_id(ENCRYPTION_KEY_ASSET).await? {
-            let b64 = self
-                .http
-                .get(format!(
-                    "{API_BASE}/repos/{}/{REPO_NAME}/releases/assets/{asset_id}",
-                    self.username
-                ))
-                .headers({
-                    let mut h = self.api_headers();
-                    h.insert("Accept", "application/octet-stream".parse().unwrap());
-                    h
-                })
-                .send()
-                .await
-                .map_err(|e| format!("Key download failed: {e}"))?
-                .text()
-                .await
-                .map_err(|e| format!("Key read failed: {e}"))?;
-            let bytes = BASE64
-                .decode(b64.trim())
-                .map_err(|e| format!("Key decode failed: {e}"))?;
-            if bytes.len() != 32 {
-                return Err(format!("Encryption key wrong length: {}", bytes.len()));
-            }
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&bytes);
-            save_encryption_key(&key)?;
-            return Ok(key);
-        }
-
-        // Generate fresh key and upload
-        use rand::RngCore;
-        let mut key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut key);
-        let b64 = BASE64.encode(key);
-        self.upload_asset(ENCRYPTION_KEY_ASSET, b64.as_bytes(), "text/plain")
-            .await?;
-        save_encryption_key(&key)?;
-        Ok(key)
-    }
-
     pub async fn connect(app: &tauri::AppHandle) -> Result<Self, String> {
         let (token, user_id, username) = oauth_connect(app).await?;
         let http = reqwest::Client::builder()
@@ -556,7 +487,6 @@ impl GitHubClient {
             user_id,
             username,
             release_id: 0,
-            encryption_key: [0u8; 32],
             http,
         };
         let repo_created = client.ensure_repo().await?;
@@ -564,7 +494,6 @@ impl GitHubClient {
             client.wait_for_repo_ready().await?;
         }
         client.release_id = client.ensure_release().await?;
-        client.encryption_key = client.get_or_create_encryption_key().await?;
         save_token(&client.token, client.user_id, &client.username)?;
         Ok(client)
     }
@@ -592,11 +521,9 @@ impl GitHubClient {
             user_id,
             username,
             release_id: 0,
-            encryption_key: [0u8; 32],
             http,
         };
         client.release_id = client.ensure_release().await?;
-        client.encryption_key = client.get_or_create_encryption_key().await?;
         Ok(Some(client))
     }
 
@@ -653,11 +580,23 @@ impl GitHubClient {
         expected_sha: Option<&str>,
     ) -> Result<bool, String> {
         let json = serde_json::to_vec(metadata).map_err(|e| e.to_string())?;
-        let content = BASE64.encode(&json);
+        self.put_file(METADATA_PATH, &json, expected_sha, "zen-sync: update backup metadata")
+            .await
+    }
 
+    /// Create or update a file in the repository. Without `expected_sha` it
+    /// is only created if absent. Returns `Ok(false)` on a conflict: the file
+    /// changed since `expected_sha` was read, or already exists.
+    async fn put_file(
+        &self,
+        path: &str,
+        content: &[u8],
+        expected_sha: Option<&str>,
+        message: &str,
+    ) -> Result<bool, String> {
         let mut body = serde_json::json!({
-            "message": "zen-sync: update backup metadata",
-            "content": content,
+            "message": message,
+            "content": BASE64.encode(content),
         });
         if let Some(sha) = expected_sha {
             body["sha"] = serde_json::json!(sha);
@@ -666,25 +605,101 @@ impl GitHubClient {
         let resp = self
             .http
             .put(format!(
-                "{API_BASE}/repos/{}/{REPO_NAME}/contents/{METADATA_PATH}",
+                "{API_BASE}/repos/{}/{REPO_NAME}/contents/{path}",
                 self.username
             ))
             .headers(self.api_headers())
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("Metadata write failed: {e}"))?;
+            .map_err(|e| format!("Writing {path} failed: {e}"))?;
         // 409: the sha is stale. 422: no sha was sent but the file now exists.
         let status = resp.status();
         if status == reqwest::StatusCode::CONFLICT
             || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
         {
-            crate::zslog!("[github] metadata write conflict ({status})");
+            crate::zslog!("[github] write conflict on {path} ({status})");
             return Ok(false);
         }
         resp.error_for_status()
-            .map_err(|e| format!("Metadata write error: {e}"))?;
+            .map_err(|e| format!("Writing {path} failed: {e}"))?;
         Ok(true)
+    }
+
+    async fn delete_file(&self, path: &str, sha: &str, message: &str) -> Result<(), String> {
+        self.http
+            .delete(format!(
+                "{API_BASE}/repos/{}/{REPO_NAME}/contents/{path}",
+                self.username
+            ))
+            .headers(self.api_headers())
+            .json(&serde_json::json!({ "message": message, "sha": sha }))
+            .send()
+            .await
+            .map_err(|e| format!("Deleting {path} failed: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("Deleting {path} failed: {e}"))?;
+        Ok(())
+    }
+
+    // ── Key file ──────────────────────────────────────────────────────────────
+
+    /// The key file and its sha, if encryption has been set up.
+    pub async fn read_key_file(&self) -> Result<Option<(KeyFile, String)>, String> {
+        let Some(c) = self.get_contents(KEY_FILE_PATH).await? else {
+            return Ok(None);
+        };
+        let decoded = BASE64
+            .decode(c.content.replace('\n', ""))
+            .map_err(|e| format!("Key file decode error: {e}"))?;
+        let file: KeyFile = serde_json::from_slice(&decoded)
+            .map_err(|e| format!("The backup repository's key file is damaged: {e}"))?;
+        file.check_version()?;
+        Ok(Some((file, c.sha)))
+    }
+
+    /// Write the key file: created only if absent when `expected_sha` is
+    /// `None`. `Ok(false)` if another device wrote it first.
+    pub async fn write_key_file(&self, file: &KeyFile, expected_sha: Option<&str>) -> Result<bool, String> {
+        let json = serde_json::to_vec_pretty(file).map_err(|e| e.to_string())?;
+        self.put_file(KEY_FILE_PATH, &json, expected_sha, "zen-sync: update encryption key file")
+            .await
+    }
+
+    /// Whether the repository holds backups or a key from before the key
+    /// file existed, which `delete_all_backups` would remove.
+    pub async fn has_backups_without_key_file(&self) -> Result<bool, String> {
+        if self.get_contents(METADATA_PATH).await?.is_some() {
+            return Ok(true);
+        }
+        Ok(self
+            .list_assets()
+            .await?
+            .iter()
+            .any(|a| a.name == OLD_KEY_ASSET || a.name.starts_with(SNAPSHOT_ASSET_PREFIX)))
+    }
+
+    /// Delete every snapshot, the backup list and any old unwrapped key.
+    /// With `include_key_file`, the key file too.
+    pub async fn delete_all_backups(&self, include_key_file: bool) -> Result<(), String> {
+        let mut deleted = 0;
+        for asset in self.list_assets().await? {
+            if asset.name == OLD_KEY_ASSET || asset.name.starts_with(SNAPSHOT_ASSET_PREFIX) {
+                self.delete_asset(asset.id).await?;
+                deleted += 1;
+            }
+        }
+        if let Some(c) = self.get_contents(METADATA_PATH).await? {
+            self.delete_file(METADATA_PATH, &c.sha, "zen-sync: remove backups").await?;
+        }
+        if include_key_file {
+            if let Some(c) = self.get_contents(KEY_FILE_PATH).await? {
+                self.delete_file(KEY_FILE_PATH, &c.sha, "zen-sync: remove encryption key file")
+                    .await?;
+            }
+        }
+        crate::zslog!("[github] deleted {deleted} snapshot and key assets");
+        Ok(())
     }
 
     // ── Legacy snapshots ──────────────────────────────────────────────────────
@@ -706,21 +721,8 @@ impl GitHubClient {
             self.delete_asset(id).await?;
         }
         if let Some(sha) = &legacy.metadata_sha {
-            self.http
-                .delete(format!(
-                    "{API_BASE}/repos/{}/{REPO_NAME}/contents/{LEGACY_METADATA_PATH}",
-                    self.username
-                ))
-                .headers(self.api_headers())
-                .json(&serde_json::json!({
-                    "message": "zen-sync: remove legacy full-profile snapshots",
-                    "sha": sha,
-                }))
-                .send()
-                .await
-                .map_err(|e| format!("Legacy metadata delete failed: {e}"))?
-                .error_for_status()
-                .map_err(|e| format!("Legacy metadata delete error: {e}"))?;
+            self.delete_file(LEGACY_METADATA_PATH, sha, "zen-sync: remove legacy full-profile snapshots")
+                .await?;
         }
         crate::zslog!(
             "[github] deleted {} legacy snapshot assets",

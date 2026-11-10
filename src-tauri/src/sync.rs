@@ -1,8 +1,16 @@
 use std::path::{Path, PathBuf};
 
 use crate::bundle::{self, RestoreReport, Selection};
+use crate::crypto::{self, DataKey};
 use crate::github::{GitHubClient, MachineMetadata, SnapshotEntry, SyncMetadata};
-use crate::{crypto, profile};
+use crate::profile;
+
+/// Where snapshots go, and the key they are encrypted with.
+#[derive(Clone, Copy)]
+pub struct Remote<'a> {
+    pub client: &'a GitHubClient,
+    pub key: &'a DataKey,
+}
 
 /// Pre-restore safety copies kept in the app config dir.
 const SAFETY_COPIES_TO_KEEP: usize = 3;
@@ -67,7 +75,7 @@ fn record_snapshot(
 /// Back up Sine mods and extension data to GitHub.
 /// Returns the ISO timestamp of the backup.
 pub async fn backup(
-    client: &GitHubClient,
+    remote: Remote<'_>,
     machine_name: &str,
     machine_id: &str,
     max_snapshots: u8,
@@ -75,6 +83,7 @@ pub async fn backup(
     delete_legacy: bool,
     on_progress: impl Fn(&str) + Send,
 ) -> Result<String, String> {
+    let client = remote.client;
     on_progress("Checking for old snapshots…");
     let legacy = client.find_legacy_snapshots().await?;
     if !legacy.is_empty() && !delete_legacy {
@@ -101,7 +110,7 @@ pub async fn backup(
     );
 
     on_progress("Encrypting…");
-    let encrypted = crypto::encrypt(&archive, &client.encryption_key)?;
+    let encrypted = crypto::encrypt(&archive, remote.key)?;
     crate::zslog!("[sync] backup: encrypted {} bytes", encrypted.len());
 
     on_progress("Reading current backup list…");
@@ -175,7 +184,7 @@ pub async fn backup(
 /// reused, so if the slot now holds a different snapshot the restore stops
 /// instead of applying something the user didn't choose.
 pub async fn restore(
-    client: &GitHubClient,
+    remote: Remote<'_>,
     machine_id: &str,
     index: u8,
     expected_pushed_at: Option<&str>,
@@ -183,6 +192,7 @@ pub async fn restore(
     safety_root: PathBuf,
     on_progress: impl Fn(&str) + Send,
 ) -> Result<RestoreReport, String> {
+    let client = remote.client;
     if let Some(expected) = expected_pushed_at {
         on_progress("Checking the backup list…");
         let current = client.read_metadata().await?.and_then(|m| {
@@ -208,7 +218,7 @@ pub async fn restore(
     let encrypted = client.download_snapshot(machine_id, index).await?;
 
     on_progress("Decrypting…");
-    let archive = crypto::decrypt(&encrypted, &client.encryption_key)?;
+    let archive = crypto::decrypt(&encrypted, remote.key)?;
 
     // Zen may have been opened while the snapshot downloaded.
     if crate::zen_check::is_running() {

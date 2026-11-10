@@ -176,7 +176,8 @@ release page so the new exe can be downloaded.
 
 Zen's Mozilla account sync covers spaces, containers, bookmarks, history,
 passwords, installed extensions and `storage.sync`. Zen Sync only backs up
-what it misses. A snapshot is an encrypted zip with a `manifest.json`:
+what it misses. A snapshot is an encrypted zip with a `manifest.json`
+(encryption: see "Encryption" below):
 
 | Data | Source | Notes |
 |------|--------|-------|
@@ -216,7 +217,27 @@ machines. Only choices that differ from the default are saved.
 
 Before a restore, every file and folder it will replace is copied to
 `%APPDATA%\app.zen.zensync\restore-backups\<timestamp>\`. The last three copies
-are kept.
+are kept. If the restore fails part-way, everything is put back from this copy.
+
+### Encryption
+
+- A snapshot asset is `"ZSE2"` + an 8-byte key id + a 12-byte nonce +
+  AES-256-GCM ciphertext; the magic and key id are authenticated data. The key
+  id is a truncated SHA-256 of the key.
+- The 256-bit data key lives in the repository only in `encryption-v2.json`,
+  wrapped twice with AES-256-GCM: under Argon2id(passphrase) and under
+  Argon2id(recovery code), each with its own salt (64 MiB, 3 passes, 1 lane).
+  The wrapped copies are bound to their slot by associated data.
+- The recovery code is 25 Crockford base32 characters; when typing it, case,
+  dashes and spaces don't matter, and I/L/O read as 1/1/0.
+- Each device keeps the data key in Windows Credential Manager (`zen-sync` /
+  `data-key-v2`) and compares its id with the key file's on every start. A
+  mismatch (encryption was set up again elsewhere) asks for the passphrase.
+- The key file is created only if absent, so two devices setting up at once
+  can't end up with different keys.
+- Setup deletes everything made with the old scheme: `encryption-key.b64`, all
+  `mods-*` assets and `metadata-v2.json`. Start over does the same plus the key
+  file.
 
 ---
 

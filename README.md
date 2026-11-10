@@ -36,14 +36,15 @@ Unlike [Zync](https://github.com/PixelPusher247/zync), there are no background d
 1. **Backup** — Click "Back up now". Zen Sync zips your Sine mods, the values of the settings those mods declare, and the data of your selected extensions, encrypts the archive with AES-256-GCM, and uploads it as a release asset to a private `zen-sync-backup` repo in your GitHub account.
 2. **Restore** — Click "Restore latest backup" to restore the newest snapshot from any device, or open the History screen to pick an older one. Your mods folder is replaced with the snapshot's, mod settings are written into `prefs.js` one by one, and extension storage is copied in. Extension storage is tied to a per-profile UUID, so Zen Sync rewrites it to match the UUID the extension has on this device. Zen's shortcuts file is replaced and the `about:config` prefs you picked are written in. Nothing else in `prefs.js` is touched, so device name and Mozilla account stay as they are.
 3. **Zen must be closed** — All operations are hard-blocked if Zen Browser is running, preventing database corruption and conflicting writes to files the browser holds open. The app notices within a couple of seconds when you close or open Zen.
+4. **Your passphrase unlocks the key** — On the first device you choose a backup passphrase and get a recovery code. The key that encrypts your snapshots is stored in the repository only locked with those two, so GitHub, or anyone else who can read the repository, can't decrypt your backups. Each further device asks once for the passphrase (or the recovery code) and then keeps the key in Windows Credential Manager.
 
 ---
 
 ## Features
 
 - **Manual only** — no background sync, no auto-triggers, no network use at rest
-- **AES-256-GCM encryption** with PBKDF2-HMAC-SHA256 key derivation (100 k rounds); GitHub never sees plaintext data
-- **Encryption key in OS keychain** — stored in Windows Credential Manager, never on disk
+- **AES-256-GCM encryption** under a random key that only your passphrase or recovery code can unlock; GitHub never sees plaintext data or a usable key
+- **Passphrase and recovery code** — enter one of them once per device; change the passphrase or make a new recovery code in Settings without re-encrypting anything
 - **Works alongside Mozilla sync** — only data native sync doesn't cover is backed up; device identity and sync-account prefs are never read or written
 - **Choose what to sync** — turn Sine mods, mod settings, extension data, permissions, shortcuts, Zen's keyboard shortcuts and `about:config` prefs on or off per device; the choice applies to both backups and restores on that device
 - **Per-pref selection** — `about:config` sync is off until you turn it on, and the prefs screen lists every pref it would carry so you can drop individual ones; prefs that describe the machine are never offered
@@ -91,12 +92,15 @@ Download the latest Windows installer from the [Releases](https://github.com/Pix
 
 ## Security
 
-- Profile bundles are encrypted with **AES-256-GCM** before leaving your machine
-- The encryption key is auto-generated on first connect and stored in **Windows Credential Manager** — it never touches disk in plaintext
+- Snapshots are encrypted with **AES-256-GCM** under a random 256-bit key before leaving your machine
+- That key is stored in the repository (`encryption-v2.json`) only **wrapped**: once under a key derived from your passphrase with **Argon2id** (64 MiB, 3 passes), and once under one derived from your recovery code. Anyone who can read the repository still needs one of the two
+- On each device the unwrapped key is kept in **Windows Credential Manager**; disconnecting GitHub removes it
+- The recovery code is 25 random characters (125 bits) and is shown only once. If you lose both it and the passphrase, nobody can decrypt your backups; the only way on is **Start over**, which deletes them
+- Passphrases are at least 10 characters. A long one matters: a copy of the key file lets someone try guesses offline, and Argon2id only makes each guess slow
 - The backup repository is **private** and owned by your GitHub account
 - Before every restore, the files it will replace are copied to `%APPDATA%\app.zen.zensync\restore-backups\{timestamp}\` (the last 3 are kept), giving you a manual rollback path independent of the GitHub history
+- Upgrading to 0.6: Zen Sync 0.5 and earlier uploaded the key unprotected, next to the snapshots. Setting a passphrase in 0.6 deletes that key and every backup made with it, so update all your devices and back up again
 - Upgrading from 0.1.x: the first backup deletes the old full-profile snapshots from GitHub after asking for confirmation
-- Snapshots now use a newer format that can leave out mods or mod settings. zen-sync 0.2.x refuses to restore them and asks you to update, rather than wiping the mods they don't contain
 
 ---
 

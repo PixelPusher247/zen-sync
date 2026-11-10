@@ -6,6 +6,7 @@ import type {
   ExtensionWithSelection,
   PrefWithSelection,
   RestoreReport,
+  SetupEncryptionResult,
   SnapshotInfo,
   SyncOptions,
 } from "./types";
@@ -16,6 +17,24 @@ export const bridge = {
   connectGithub: () => invoke<AppStatus>("connect_github_cmd"),
 
   disconnectGithub: () => invoke<void>("disconnect_github_cmd"),
+
+  /** First device: choose the passphrase. Returns the recovery code to show once. */
+  setupEncryption: (passphrase: string) =>
+    invoke<SetupEncryptionResult>("setup_encryption_cmd", { passphrase }),
+
+  /** Another device: unlock with the passphrase or the recovery code. */
+  unlockEncryption: (secret: string) =>
+    invoke<AppStatus>("unlock_encryption_cmd", { secret }),
+
+  changePassphrase: (current: string, newPassphrase: string) =>
+    invoke<void>("change_passphrase_cmd", { current, newPassphrase }),
+
+  /** Returns the new recovery code; the old one stops working. */
+  newRecoveryCode: (passphrase: string) =>
+    invoke<string>("new_recovery_code_cmd", { passphrase }),
+
+  /** Deletes every backup and the key file. */
+  resetEncryption: () => invoke<AppStatus>("reset_encryption_cmd"),
 
   // Progress updates arrive via the "sync-progress" event — listen separately.
   backupNow: (deleteLegacy: boolean) =>
