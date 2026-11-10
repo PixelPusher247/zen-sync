@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { bridge } from "../bridge";
 import { useConfirm } from "../components/ConfirmDialog";
 import { describeSynced, formatDate } from "../format";
@@ -68,6 +69,11 @@ export function OperationsProvider({ status, onStatusChange, children }: Provide
   const [revision, setRevision] = useState(0);
   // Guards against a second start before the first re-render disables the buttons.
   const busyRef = useRef(false);
+  // A backup or restore is actually running in the backend (not just asking
+  // for confirmation).
+  const runningRef = useRef(false);
+  // Which backup a "Backup complete" timer belongs to.
+  const backupRunRef = useRef(0);
   const syncOptions = status.syncOptions;
 
   useEffect(() => {
@@ -76,6 +82,28 @@ export function OperationsProvider({ status, onStatusChange, children }: Provide
       unlisten.then((f) => f());
     };
   }, []);
+
+  // Closing the window quits the app (there is no tray), which would cut a
+  // restore off half-way. Ask first while something is running; this covers
+  // the ✕ button and Alt+F4 alike.
+  useEffect(() => {
+    const window = getCurrentWindow();
+    const unlisten = window.onCloseRequested(async (event) => {
+      if (!runningRef.current) return;
+      event.preventDefault();
+      const quit = await confirm({
+        title: "Quit while this is running?",
+        message:
+          "A backup or restore is still running. Quitting now can leave it unfinished.",
+        confirmLabel: "Quit anyway",
+        danger: true,
+      });
+      if (quit) await window.destroy();
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, [confirm]);
 
   const dismissBackup = useCallback(() => {
     setBackupState((s) => (s === "running" ? s : "idle"));
@@ -120,15 +148,24 @@ export function OperationsProvider({ status, onStatusChange, children }: Provide
         setBackupState("idle");
         return;
       }
+      runningRef.current = true;
       await bridge.backupNow(legacyCount > 0);
+      runningRef.current = false;
       onStatusChange(await bridge.getStatus());
       setRevision((r) => r + 1);
       setBackupState("success");
-      setTimeout(() => setBackupState((s) => (s === "success" ? "idle" : s)), 4000);
+      const run = ++backupRunRef.current;
+      setTimeout(() => {
+        // Only clear this backup's message, not a later one's.
+        if (backupRunRef.current === run) {
+          setBackupState((s) => (s === "success" ? "idle" : s));
+        }
+      }, 4000);
     } catch (e) {
       setBackupError(String(e));
       setBackupState("error");
     } finally {
+      runningRef.current = false;
       busyRef.current = false;
     }
   }, [confirm, onStatusChange]);
@@ -149,8 +186,8 @@ export function OperationsProvider({ status, onStatusChange, children }: Provide
                 {formatDate(snap.pushedAt)}).
               </p>
               <p className="mt-2">
-                The current files are saved locally first, so the restore can
-                be rolled back by hand.
+                The current files are saved locally first. If the restore
+                fails part-way, they are put back automatically.
               </p>
             </>
           ),
@@ -165,7 +202,11 @@ export function OperationsProvider({ status, onStatusChange, children }: Provide
         setRestoreReport(null);
         setProgress("Starting restore…");
         setRestoringKey(snapshotKey(snap));
-        const result = await bridge.restoreSnapshot(snap.index, snap.machineId);
+        runningRef.current = true;
+        // pushedAt lets the backend refuse if the slot now holds a newer
+        // snapshot than the one named in the dialog.
+        const result = await bridge.restoreSnapshot(snap.index, snap.machineId, snap.pushedAt);
+        runningRef.current = false;
         onStatusChange(await bridge.getStatus());
         setRestoreReport(result);
         if (result.warnings.length === 0) {
@@ -175,6 +216,7 @@ export function OperationsProvider({ status, onStatusChange, children }: Provide
         setRestoreError(String(e));
       } finally {
         setRestoringKey(null);
+        runningRef.current = false;
         busyRef.current = false;
       }
     },

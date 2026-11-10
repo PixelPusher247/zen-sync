@@ -5,6 +5,65 @@ Everything that changed in Zen Sync, newest first.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] — 2026-11-10
+
+Fixes from a review of the whole app.
+
+### Fixed
+
+- **Snapshots to keep.** After lowering and then raising the limit, every
+  backup overwrote the newest snapshot instead of keeping the history. New
+  backups now fill free slots first.
+- **A restore that fails part-way puts everything back.** Before, it could
+  leave new mods with old settings, or extension data nothing pointed to. Your
+  files are restored from the safety copy and the error says so.
+- **An unreadable `prefs.js` stops the backup or restore.** A restore used to
+  carry on as if the file were empty and rewrite it with only the restored
+  prefs, dropping all the others.
+- **Starting without a network.** With *Launch at login*, a slow network made
+  the app start hidden and signed out. It now shows the window, says it is
+  reconnecting, and retries for a few minutes.
+- **Quitting or disconnecting mid-operation.** Closing the window during a
+  backup or restore now asks first, *Disconnect GitHub* waits until it's done,
+  and two operations can no longer run at once.
+- **Interrupted uploads** no longer delete the snapshot the slot held before,
+  and a backup saved at the same moment as another device's is retried instead
+  of failing.
+- **Restore picks what you chose.** If another device backed up since the list
+  was loaded and the slot now holds a newer snapshot, the restore stops and
+  asks you to refresh. Lists also refresh when the window regains focus.
+- **Device names with accents or non-Latin letters** (e.g. "Büro-PC") now get
+  an id GitHub keeps as-is, so their snapshots can be found again.
+- **Extension shortcuts** that can't be restored now come with a warning
+  saying why, instead of being skipped silently.
+- **Several Zen installs** (e.g. release and Twilight): the profile used most
+  recently is picked, not whichever `profiles.ini` lists first.
+- **Damaged settings file.** Settings are saved atomically, and a damaged file
+  is kept as `state.json.damaged` instead of being silently replaced.
+- Renaming the device always keeps its snapshots with it, including during or
+  before its first backup.
+- Sine's own settings are backed up even when no mods are installed.
+- The dashboard's extension count matches what a backup contains.
+- Zen running as administrator is detected, and Zen is checked again just
+  before a restore writes anything.
+- The safety copy fails instead of silently skipping folders it can't read.
+- GitHub sign-in checks a `state` value, so a local program can't slip in its
+  own account.
+- Smaller fixes: a replaced confirm dialog no longer leaves backup and restore
+  stuck; Escape closes dialogs wherever focus is; "Yesterday" goes by calendar
+  day and relative times stay current; a failed settings save no longer leaves
+  the switch and the saved value disagreeing; a selection change that fails to
+  save after leaving its screen is reported.
+
+### Notes
+
+- A device whose name has accented or non-Latin letters starts a new set of
+  snapshots under its new id. Its earlier snapshots were most likely
+  unreachable already.
+- The encryption key is still stored in the backup repository next to the
+  snapshots. Changing that needs a new way to move the key between devices and
+  is planned separately.
+
 ## [0.5.1] — 2026-11-10
 
 ### Fixed
@@ -250,6 +309,7 @@ private GitHub repository.
   replacing profile files the browser holds open.
 - In-app update banner, system tray icon, and autostart (off by default).
 
+[0.5.2]: https://github.com/PixelPusher247/zen-sync/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/PixelPusher247/zen-sync/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/PixelPusher247/zen-sync/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/PixelPusher247/zen-sync/compare/v0.3.1...v0.4.0

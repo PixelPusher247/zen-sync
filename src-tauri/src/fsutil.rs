@@ -11,25 +11,50 @@ pub struct WalkEntry {
 /// before their contents. Symlinks are skipped.
 pub fn walk(root: &Path) -> Vec<WalkEntry> {
     let mut out = Vec::new();
-    walk_into(root, root, &mut out);
+    // Lenient: anything that can't be read is skipped.
+    let _ = walk_into(root, root, &mut out, false);
     out
 }
 
-fn walk_into(dir: &Path, root: &Path, out: &mut Vec<WalkEntry>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+/// Like `walk`, but fails on anything it can't read instead of skipping it.
+/// Used where a silently incomplete listing would lose data.
+pub fn walk_strict(root: &Path) -> Result<Vec<WalkEntry>, String> {
+    let mut out = Vec::new();
+    walk_into(root, root, &mut out, true)?;
+    Ok(out)
+}
+
+fn walk_into(dir: &Path, root: &Path, out: &mut Vec<WalkEntry>, strict: bool) -> Result<(), String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if strict => return Err(format!("Failed to list {}: {e}", dir.display())),
+        Err(_) => return Ok(()),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => paths.push(entry.path()),
+            Err(e) if strict => return Err(format!("Failed to list {}: {e}", dir.display())),
+            Err(_) => {}
+        }
+    }
     paths.sort();
     for path in paths {
-        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) if strict => return Err(format!("Failed to read {}: {e}", path.display())),
+            Err(_) => continue,
+        };
         let Ok(rel) = path.strip_prefix(root) else { continue };
         let rel = rel.to_string_lossy().replace('\\', "/");
         if meta.is_dir() {
             out.push(WalkEntry { rel, path: path.clone(), is_dir: true });
-            walk_into(&path, root, out);
+            walk_into(&path, root, out, strict)?;
         } else if meta.is_file() {
             out.push(WalkEntry { rel, path, is_dir: false });
         }
     }
+    Ok(())
 }
 
 /// Total size in bytes of all files under `root`.
@@ -55,7 +80,9 @@ pub fn copy_all(src: &Path, dst: &Path) -> Result<(), String> {
     }
     std::fs::create_dir_all(dst)
         .map_err(|e| format!("Failed to create {}: {e}", dst.display()))?;
-    for entry in walk(src) {
+    // Strict: a safety copy that silently missed a folder would let the
+    // restore delete the only copy of it.
+    for entry in walk_strict(src)? {
         let target = dst.join(&entry.rel);
         if entry.is_dir {
             std::fs::create_dir_all(&target)

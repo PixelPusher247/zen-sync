@@ -17,6 +17,8 @@ export interface AppStatus {
   snapshotCount: number;
   autostartEnabled: boolean;
   syncOptions: SyncOptions;
+  /** A saved sign-in is still being restored, e.g. while the network comes up. */
+  reconnecting?: boolean;
 }
 
 /** What this device backs up and restores. */

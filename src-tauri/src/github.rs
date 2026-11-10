@@ -41,12 +41,18 @@ pub struct MachineMetadata {
 
 impl MachineMetadata {
     /// Index slot to write to next (ring buffer within this machine's slots).
+    ///
+    /// While there is room, the lowest free slot below `max_snapshots`: the
+    /// used slots are not always `0..len`, e.g. after the limit was lowered
+    /// and raised again. Once full, the slot after the newest one.
     pub fn next_index(&self, max_snapshots: u8) -> u8 {
-        if (self.snapshots.len() as u8) < max_snapshots {
-            self.snapshots.len() as u8
-        } else {
-            (self.current_index + 1) % max_snapshots
+        let max = max_snapshots.max(1);
+        if self.snapshots.len() < max as usize {
+            if let Some(free) = (0..max).find(|i| !self.snapshots.iter().any(|s| s.index == *i)) {
+                return free;
+            }
         }
+        (self.current_index + 1) % max
     }
 
     /// Record a snapshot just uploaded to `entry.index`, keeping at most
@@ -101,6 +107,11 @@ struct Asset {
 struct ContentsResp {
     content: String,
     sha: String,
+}
+
+/// Name a snapshot is uploaded under before it replaces the slot's asset.
+fn upload_temp_name(name: &str) -> String {
+    format!("{name}.part")
 }
 
 fn snapshot_asset_name(machine_id: &str, index: u8) -> String {
@@ -204,8 +215,24 @@ struct TokenResponse {
     error_description: Option<String>,
 }
 
-async fn fetch_user(http: &reqwest::Client, token: &str) -> Result<(u64, String), String> {
-    let user: GitHubUser = http
+/// Why checking the stored token failed.
+enum UserCheckError {
+    /// GitHub rejected the token: it was revoked or expired.
+    Unauthorized(String),
+    /// Anything else, e.g. no network yet. The token may still be good.
+    Failed(String),
+}
+
+impl From<UserCheckError> for String {
+    fn from(e: UserCheckError) -> Self {
+        match e {
+            UserCheckError::Unauthorized(m) | UserCheckError::Failed(m) => m,
+        }
+    }
+}
+
+async fn fetch_user(http: &reqwest::Client, token: &str) -> Result<(u64, String), UserCheckError> {
+    let resp = http
         .get(format!("{API_BASE}/user"))
         .header("Authorization", format!("Bearer {token}"))
         .header("Accept", "application/vnd.github+json")
@@ -213,13 +240,35 @@ async fn fetch_user(http: &reqwest::Client, token: &str) -> Result<(u64, String)
         .header("User-Agent", "zen-sync-app")
         .send()
         .await
-        .map_err(|e| format!("GitHub user fetch failed: {e}"))?
+        .map_err(|e| UserCheckError::Failed(format!("GitHub user fetch failed: {e}")))?;
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(UserCheckError::Unauthorized("GitHub rejected the saved sign-in".into()));
+    }
+    let user: GitHubUser = resp
         .error_for_status()
-        .map_err(|e| format!("GitHub user fetch error: {e}"))?
+        .map_err(|e| UserCheckError::Failed(format!("GitHub user fetch error: {e}")))?
         .json()
         .await
-        .map_err(|e| format!("GitHub user parse error: {e}"))?;
+        .map_err(|e| UserCheckError::Failed(format!("GitHub user parse error: {e}")))?;
     Ok((user.id, user.login))
+}
+
+/// Value of `name` in the query string of `url`, if present.
+fn query_param(url: &str, name: &str) -> Option<String> {
+    let query = url.split_once('?')?.1;
+    let query = query.split('#').next().unwrap_or(query);
+    query.split('&').find_map(|kv| {
+        let (key, value) = kv.split_once('=')?;
+        (key == name).then(|| value.to_string())
+    })
+}
+
+/// Random hex string for the OAuth `state` parameter.
+fn random_state() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// How long the browser sign-in may take before the attempt is given up.
@@ -231,7 +280,15 @@ pub async fn oauth_connect(app: &tauri::AppHandle) -> Result<(String, u64, Strin
     let (tx, rx) = tokio::sync::oneshot::channel::<String>();
     let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
 
+    // Only a redirect carrying this value comes from the sign-in we started;
+    // anything else reaching the local port is ignored.
+    let state = random_state();
+    let expected_state = state.clone();
     let port = tauri_plugin_oauth::start(move |url| {
+        if query_param(&url, "state").as_deref() != Some(expected_state.as_str()) {
+            crate::zslog!("[github] ignored an OAuth callback without the expected state");
+            return;
+        }
         if let Some(tx) = tx.lock().unwrap().take() {
             let _ = tx.send(url);
         }
@@ -239,8 +296,8 @@ pub async fn oauth_connect(app: &tauri::AppHandle) -> Result<(String, u64, Strin
     .map_err(|e| format!("OAuth server start failed: {e}"))?;
 
     let auth_url = format!(
-        "https://github.com/login/oauth/authorize?client_id={}&scope=repo&redirect_uri=http://127.0.0.1:{}",
-        GITHUB_CLIENT_ID, port
+        "https://github.com/login/oauth/authorize?client_id={}&scope=repo&redirect_uri=http://127.0.0.1:{}&state={}",
+        GITHUB_CLIENT_ID, port, state
     );
 
     app.opener()
@@ -257,20 +314,12 @@ pub async fn oauth_connect(app: &tauri::AppHandle) -> Result<(String, u64, Strin
         }
     };
 
-    let code = redirect_url
-        .split('?')
-        .nth(1)
-        .and_then(|q| {
-            q.split('&').find_map(|kv| {
-                let mut parts = kv.splitn(2, '=');
-                if parts.next()? == "code" {
-                    parts.next().map(str::to_string)
-                } else {
-                    None
-                }
-            })
-        })
-        .ok_or("OAuth redirect did not contain a code")?;
+    let code = query_param(&redirect_url, "code").ok_or_else(|| {
+        match query_param(&redirect_url, "error") {
+            Some(err) => format!("GitHub sign-in was not completed ({err})."),
+            None => "OAuth redirect did not contain a code".to_string(),
+        }
+    })?;
 
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -302,7 +351,7 @@ pub async fn oauth_connect(app: &tauri::AppHandle) -> Result<(String, u64, Strin
     }
 
     let token = resp.access_token.ok_or("No access_token in response")?;
-    let (user_id, username) = fetch_user(&http, &token).await?;
+    let (user_id, username) = fetch_user(&http, &token).await.map_err(String::from)?;
     Ok((token, user_id, username))
 }
 
@@ -528,9 +577,15 @@ impl GitHubClient {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| format!("HTTP client error: {e}"))?;
-        if let Err(e) = fetch_user(&http, &token).await {
-            crate::zslog!("[github] token invalid on restore: {e}");
-            return Ok(None);
+        match fetch_user(&http, &token).await {
+            Ok(_) => {}
+            // Only a rejected token means "signed out"; a network error at
+            // login must not, or the app would quietly come up disconnected.
+            Err(UserCheckError::Unauthorized(e)) => {
+                crate::zslog!("[github] token invalid on restore: {e}");
+                return Ok(None);
+            }
+            Err(UserCheckError::Failed(e)) => return Err(e),
         }
         let mut client = GitHubClient {
             token,
@@ -589,11 +644,14 @@ impl GitHubClient {
         }))
     }
 
+    /// Write the metadata file. Returns `Ok(false)` if it changed since
+    /// `expected_sha` was read (another device saved in between), so the
+    /// caller can re-read and try again.
     pub async fn write_metadata(
         &self,
         metadata: &SyncMetadata,
         expected_sha: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let json = serde_json::to_vec(metadata).map_err(|e| e.to_string())?;
         let content = BASE64.encode(&json);
 
@@ -605,7 +663,8 @@ impl GitHubClient {
             body["sha"] = serde_json::json!(sha);
         }
 
-        self.http
+        let resp = self
+            .http
             .put(format!(
                 "{API_BASE}/repos/{}/{REPO_NAME}/contents/{METADATA_PATH}",
                 self.username
@@ -614,10 +673,18 @@ impl GitHubClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("Metadata write failed: {e}"))?
-            .error_for_status()
+            .map_err(|e| format!("Metadata write failed: {e}"))?;
+        // 409: the sha is stale. 422: no sha was sent but the file now exists.
+        let status = resp.status();
+        if status == reqwest::StatusCode::CONFLICT
+            || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        {
+            crate::zslog!("[github] metadata write conflict ({status})");
+            return Ok(false);
+        }
+        resp.error_for_status()
             .map_err(|e| format!("Metadata write error: {e}"))?;
-        Ok(())
+        Ok(true)
     }
 
     // ── Legacy snapshots ──────────────────────────────────────────────────────
@@ -716,18 +783,19 @@ impl GitHubClient {
         Ok(())
     }
 
+    /// Upload a release asset and return its id.
     async fn upload_asset(
         &self,
         name: &str,
         data: &[u8],
         content_type: &str,
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
         crate::zslog!("[github] uploading '{}' ({} bytes)", name, data.len());
         let upload_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
             .build()
             .map_err(|e| format!("HTTP client error: {e}"))?;
-        upload_client
+        let asset: Asset = upload_client
             .post(format!(
                 "{UPLOAD_BASE}/repos/{}/{REPO_NAME}/releases/{}/assets?name={name}",
                 self.username, self.release_id
@@ -739,12 +807,35 @@ impl GitHubClient {
             .await
             .map_err(|e| format!("Asset upload failed: {e}"))?
             .error_for_status()
-            .map_err(|e| format!("Asset upload error: {e}"))?;
-        crate::zslog!("[github] upload complete: '{}'", name);
+            .map_err(|e| format!("Asset upload error: {e}"))?
+            .json()
+            .await
+            .map_err(|e| format!("Asset upload parse error: {e}"))?;
+        crate::zslog!("[github] upload complete: '{}'", asset.name);
+        Ok(asset.id)
+    }
+
+    async fn rename_asset(&self, asset_id: u64, name: &str) -> Result<(), String> {
+        self.http
+            .patch(format!(
+                "{API_BASE}/repos/{}/{REPO_NAME}/releases/assets/{asset_id}",
+                self.username
+            ))
+            .headers(self.api_headers())
+            .json(&serde_json::json!({ "name": name }))
+            .send()
+            .await
+            .map_err(|e| format!("Asset rename failed: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("Asset rename error: {e}"))?;
         Ok(())
     }
 
-    /// Upload a snapshot bundle for the given machine_id + index slot.
+    /// Upload a snapshot bundle for the given machine_id + index slot,
+    /// replacing what the slot held.
+    ///
+    /// The new file goes up under a temporary name first, so a failed or
+    /// interrupted upload leaves the slot's current snapshot intact.
     pub async fn upload_snapshot(
         &self,
         machine_id: &str,
@@ -752,10 +843,18 @@ impl GitHubClient {
         data: &[u8],
     ) -> Result<(), String> {
         let name = snapshot_asset_name(machine_id, index);
+        let temp_name = upload_temp_name(&name);
+        // Leftover from an earlier upload that was cut off.
+        if let Some(id) = self.get_asset_id(&temp_name).await? {
+            self.delete_asset(id).await?;
+        }
+        let new_id = self
+            .upload_asset(&temp_name, data, "application/octet-stream")
+            .await?;
         if let Some(id) = self.get_asset_id(&name).await? {
             self.delete_asset(id).await?;
         }
-        self.upload_asset(&name, data, "application/octet-stream").await
+        self.rename_asset(new_id, &name).await
     }
 
     pub async fn download_snapshot(
@@ -765,9 +864,13 @@ impl GitHubClient {
     ) -> Result<Vec<u8>, String> {
         let name = snapshot_asset_name(machine_id, index);
         crate::zslog!("[github] downloading '{}'", name);
-        let asset_id = self
-            .get_asset_id(&name)
-            .await?
+        let assets = self.list_assets().await?;
+        let find = |n: &str| assets.iter().find(|a| a.name == n).map(|a| a.id);
+        // If the rename after an upload failed, the snapshot is still under
+        // its temporary name.
+        let temp_name = upload_temp_name(&name);
+        let asset_id = find(name.as_str())
+            .or_else(|| find(temp_name.as_str()))
             .ok_or_else(|| format!("Snapshot asset '{name}' not found"))?;
 
         let download_client = reqwest::Client::builder()
@@ -804,11 +907,13 @@ impl GitHubClient {
         machine_id: &str,
         indices: &[u8],
     ) -> Result<(), String> {
+        let assets = self.list_assets().await?;
         for &idx in indices {
             let name = snapshot_asset_name(machine_id, idx);
-            if let Some(id) = self.get_asset_id(&name).await? {
-                self.delete_asset(id).await?;
-                crate::zslog!("[github] deleted expired asset '{}'", name);
+            let temp_name = upload_temp_name(&name);
+            for asset in assets.iter().filter(|a| a.name == name || a.name == temp_name) {
+                self.delete_asset(asset.id).await?;
+                crate::zslog!("[github] deleted expired asset '{}'", asset.name);
             }
         }
         Ok(())

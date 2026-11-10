@@ -95,7 +95,12 @@
 
     switch (cmd) {
       case "get_status_cmd":
-        return { ...status, connected: m.connected, syncOptions: { ...status.syncOptions } };
+        return {
+          ...status,
+          connected: m.connected,
+          reconnecting: !m.connected && !!m.reconnecting,
+          syncOptions: { ...status.syncOptions },
+        };
       case "connect_github_cmd":
         await wait(1200);
         m.connected = true;

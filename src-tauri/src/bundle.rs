@@ -182,18 +182,35 @@ fn now_epoch() -> u64 {
         .as_secs()
 }
 
-fn read_prefs(profile_dir: &Path) -> String {
-    std::fs::read_to_string(profile_dir.join(PREFS_FILE)).unwrap_or_default()
+/// prefs.js as text; empty if the profile has none yet. Any other failure is
+/// an error: carrying on with an empty string would make a restore rewrite
+/// prefs.js with only the restored prefs and drop all the others.
+fn read_prefs(profile_dir: &Path) -> Result<String, String> {
+    match std::fs::read_to_string(profile_dir.join(PREFS_FILE)) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("Couldn't read prefs.js: {e}")),
+    }
+}
+
+/// Whether Sine settings can be backed up: from installed mods, or from the
+/// Sine engine's own settings when no mods are installed.
+fn has_sine_settings(profile_dir: &Path) -> bool {
+    sine::has_mods(profile_dir) || sine::engine_installed(profile_dir)
 }
 
 /// What a backup of this profile would contain right now, counting everything
-/// the per-item choices include. The on/off options are applied by the caller.
-pub fn summarize(profile_dir: &Path, selection: &Selection) -> BackupSummary {
-    let Selection { extension_overrides: overrides, pref_overrides, .. } = selection;
-    let prefs_content = read_prefs(profile_dir);
+/// the per-item choices include. The on/off options are applied by the caller,
+/// except for extensions, which only count when one of the enabled extension
+/// options has data for them, as in `build`.
+pub fn summarize(profile_dir: &Path, selection: &Selection) -> Result<BackupSummary, String> {
+    let Selection { options, extension_overrides: overrides, pref_overrides } = selection;
+    let prefs_content = read_prefs(profile_dir)?;
     let has_mods = sine::has_mods(profile_dir);
     let declared = sine::declared_prefs(profile_dir);
     let uuids = ext_storage::uuid_map(&prefs_content).unwrap_or_default();
+    let permissions = ext_storage::read_json(&profile_dir.join(ext_storage::PERMISSIONS_FILE));
+    let settings = ext_storage::read_json(&profile_dir.join(ext_storage::SETTINGS_FILE));
 
     let mut extension_count = 0;
     let mut storage_bytes = 0;
@@ -201,17 +218,30 @@ pub fn summarize(profile_dir: &Path, selection: &Selection) -> BackupSummary {
         if !extensions::is_selected(overrides, &ext.id, &ext.name) {
             continue;
         }
+        let storage_dir = uuids
+            .get(&ext.id)
+            .map(|uuid| ext_storage::storage_local_dir(profile_dir, uuid))
+            .filter(|d| options.extension_storage && d.is_dir());
+        let has_permissions = options.extension_permissions
+            && permissions.as_ref().and_then(|p| p.get(&ext.id)).is_some();
+        let has_shortcuts = options.extension_shortcuts
+            && settings
+                .as_ref()
+                .is_some_and(|s| !ext_storage::commands_for(s, &ext.id).is_empty());
+        if storage_dir.is_none() && !has_permissions && !has_shortcuts {
+            continue;
+        }
         extension_count += 1;
-        if let Some(uuid) = uuids.get(&ext.id) {
-            storage_bytes += fsutil::dir_size(&ext_storage::storage_local_dir(profile_dir, uuid));
+        if let Some(dir) = storage_dir {
+            storage_bytes += fsutil::dir_size(&dir);
         }
     }
 
-    BackupSummary {
+    Ok(BackupSummary {
         sine_installed: sine::engine_installed(profile_dir),
         sine_engine_version: sine::engine_version(profile_dir),
         mod_count: if has_mods { sine::mod_count(profile_dir) } else { 0 },
-        mod_setting_count: if has_mods {
+        mod_setting_count: if has_sine_settings(profile_dir) {
             prefs::read_values(&prefs_content, &declared).len()
         } else {
             0
@@ -220,7 +250,7 @@ pub fn summarize(profile_dir: &Path, selection: &Selection) -> BackupSummary {
         storage_bytes,
         shortcut_count: shortcuts::read(profile_dir).as_ref().map_or(0, shortcuts::count),
         pref_count: selected_prefs(&prefs_content, &declared, pref_overrides).len(),
-    }
+    })
 }
 
 /// The about:config prefs this device would back up: everything syncable that
@@ -243,14 +273,19 @@ pub fn build(profile_dir: &Path, selection: &Selection) -> Result<(Vec<u8>, Mani
     if !options.anything() {
         return Err("Nothing is selected to back up. Choose what to sync in Settings.".into());
     }
-    let prefs_content = read_prefs(profile_dir);
+    let prefs_content = read_prefs(profile_dir)?;
     let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
 
-    let sine = if !sine::has_mods(profile_dir) {
-        crate::zslog!("[bundle] no Sine mods in profile");
+    let has_mods = sine::has_mods(profile_dir);
+    // Mod files need installed mods; settings also cover Sine's own, which
+    // exist as soon as the engine is installed.
+    let mods_included = options.sine_mods && has_mods;
+    let settings_included = options.mod_settings && has_sine_settings(profile_dir);
+    let sine = if !mods_included && !settings_included {
+        crate::zslog!("[bundle] no Sine mods or settings to back up");
         None
-    } else if options.sine_mods || options.mod_settings {
-        if options.sine_mods {
+    } else {
+        if mods_included {
             for entry in sine::mod_files(profile_dir) {
                 add_entry(&mut zip, &format!("{MODS_PREFIX}{}", entry.rel), &entry)?;
             }
@@ -258,12 +293,12 @@ pub fn build(profile_dir: &Path, selection: &Selection) -> Result<(Vec<u8>, Mani
         let declared = sine::declared_prefs(profile_dir);
         let section = SineSection {
             engine_version: sine::engine_version(profile_dir),
-            mod_count: sine::mod_count(profile_dir),
-            mods_included: options.sine_mods,
-            prefs: options
-                .mod_settings
-                .then(|| prefs::read_values(&prefs_content, &declared)),
-            declared_prefs: options.mod_settings.then_some(declared),
+            mod_count: if has_mods { sine::mod_count(profile_dir) } else { 0 },
+            // Never claim mods when there are none: a restore would empty the
+            // target's mods folder to mirror an empty snapshot.
+            mods_included,
+            prefs: settings_included.then(|| prefs::read_values(&prefs_content, &declared)),
+            declared_prefs: settings_included.then_some(declared),
         };
         crate::zslog!(
             "[bundle] sine: {} mods (files: {}), settings: {:?}",
@@ -272,9 +307,6 @@ pub fn build(profile_dir: &Path, selection: &Selection) -> Result<(Vec<u8>, Mani
             section.prefs.as_ref().map(BTreeMap::len)
         );
         Some(section)
-    } else {
-        crate::zslog!("[bundle] Sine mods and settings turned off");
-        None
     };
 
     let uuids = ext_storage::uuid_map(&prefs_content).unwrap_or_else(|e| {
@@ -440,7 +472,7 @@ pub fn apply(
     let mut report = RestoreReport::default();
 
     let prefs_path = profile_dir.join(PREFS_FILE);
-    let prefs_content = read_prefs(profile_dir);
+    let prefs_content = read_prefs(profile_dir)?;
     let mut set_prefs: BTreeMap<String, String> = BTreeMap::new();
     let mut clear_prefs: BTreeSet<String> = BTreeSet::new();
 
@@ -521,181 +553,244 @@ pub fn apply(
     }
     crate::zslog!("[bundle] safety copy at {}", safety_dir.display());
 
-    // about:config prefs first, so the options that own particular prefs
-    // overwrite them below. Prefs the snapshot doesn't carry are left alone:
-    // a pref missing from prefs.js is one at its default *or* one this device
-    // never set, and the two can't be told apart.
-    if let Some(section) = manifest.about_config.as_ref().filter(|_| options.about_config) {
-        let owned = sine::declared_prefs(profile_dir);
-        for (name, value) in &section.prefs {
-            // Re-checked here: the snapshot may come from a build with a
-            // shorter exclusion list, or from a device that syncs more prefs.
-            if prefs::is_syncable(name, value)
-                && !owned.contains(name)
-                && prefs::is_selected(pref_overrides, name)
-            {
-                set_prefs.insert(name.clone(), value.clone());
-                report.pref_count += 1;
+    // From here on files are replaced one after another. If any step fails,
+    // everything is put back from the safety copy so the profile is never
+    // left half-restored.
+    let result = (|| -> Result<(), String> {
+        // about:config prefs first, so the options that own particular prefs
+        // overwrite them below. Prefs the snapshot doesn't carry are left alone:
+        // a pref missing from prefs.js is one at its default *or* one this device
+        // never set, and the two can't be told apart.
+        if let Some(section) = manifest.about_config.as_ref().filter(|_| options.about_config) {
+            let owned = sine::declared_prefs(profile_dir);
+            for (name, value) in &section.prefs {
+                // Re-checked here: the snapshot may come from a build with a
+                // shorter exclusion list, or from a device that syncs more prefs.
+                if prefs::is_syncable(name, value)
+                    && !owned.contains(name)
+                    && prefs::is_selected(pref_overrides, name)
+                {
+                    set_prefs.insert(name.clone(), value.clone());
+                    report.pref_count += 1;
+                }
             }
-        }
-        crate::zslog!(
-            "[bundle] about:config: {} of {} prefs",
-            report.pref_count,
-            section.prefs.len()
-        );
-    }
-
-    // Zen's shortcuts: the file, plus the pref that says which schema it is in.
-    if let Some(section) = manifest.zen_shortcuts.as_ref().filter(|_| options.zen_shortcuts) {
-        write_json(&shortcuts::path(profile_dir), Some(&section.data))?;
-        if let Some(version) = shortcuts::version_to_write(
-            section.version,
-            shortcuts::version(&prefs_content),
-        ) {
-            set_prefs.insert(shortcuts::VERSION_PREF.into(), version.to_string());
-        }
-        report.shortcuts_restored = true;
-        crate::zslog!(
-            "[bundle] {} Zen shortcuts (snapshot schema {:?})",
-            shortcuts::count(&section.data),
-            section.version
-        );
-    }
-
-    // Sine mods: mirror the snapshot, then sync the declared settings.
-    if let Some(section) = sine_mods {
-        let dest = sine::mods_dir(profile_dir);
-        replace_dir(&dest)?;
-        extract_prefix(&mut archive, MODS_PREFIX, &dest)?;
-        // Sine rewrites these on startup; make sure they exist until it does.
-        for generated in ["chrome.css", "content.css"] {
-            let path = dest.join(generated);
-            if !path.exists() {
-                std::fs::write(&path, "")
-                    .map_err(|e| format!("Failed to create {}: {e}", path.display()))?;
-            }
-        }
-        report.mod_count = section.mod_count;
-    }
-
-    if let Some(values) = sine_prefs {
-        for (name, value) in values {
-            if !prefs::is_protected(name) {
-                set_prefs.insert(name.clone(), value.clone());
-            }
-        }
-        // A declared setting without a value is at its default on the source, so
-        // reset it here too, but only if the source declared it: settings of mods
-        // only this device has stay. Format 2 has no declared list; its mods, once
-        // restored, declare the same settings.
-        let source_declared = manifest.sine.as_ref().and_then(|s| s.declared_prefs.as_ref());
-        if source_declared.is_some() || sine_mods.is_some() {
-            clear_prefs.extend(sine::declared_prefs(profile_dir).into_iter().filter(|name| {
-                !values.contains_key(name) && source_declared.is_none_or(|d| d.contains(name))
-            }));
-        }
-    }
-
-    let sine_restored = manifest
-        .sine
-        .as_ref()
-        .filter(|_| sine_mods.is_some() || sine_prefs.is_some());
-    if let Some(section) = sine_restored {
-        if !sine::engine_installed(profile_dir) {
-            report.warnings.push(
-                "Sine isn't installed on this device. The restored mods and settings won't load until you install Sine."
-                    .into(),
+            crate::zslog!(
+                "[bundle] about:config: {} of {} prefs",
+                report.pref_count,
+                section.prefs.len()
             );
-        } else if let (Some(local), Some(backup)) =
-            (sine::engine_version(profile_dir), &section.engine_version)
-        {
-            if &local != backup {
+        }
+
+        // Zen's shortcuts: the file, plus the pref that says which schema it is in.
+        if let Some(section) = manifest.zen_shortcuts.as_ref().filter(|_| options.zen_shortcuts) {
+            write_json(&shortcuts::path(profile_dir), Some(&section.data))?;
+            if let Some(version) = shortcuts::version_to_write(
+                section.version,
+                shortcuts::version(&prefs_content),
+            ) {
+                set_prefs.insert(shortcuts::VERSION_PREF.into(), version.to_string());
+            }
+            report.shortcuts_restored = true;
+            crate::zslog!(
+                "[bundle] {} Zen shortcuts (snapshot schema {:?})",
+                shortcuts::count(&section.data),
+                section.version
+            );
+        }
+
+        // Sine mods: mirror the snapshot, then sync the declared settings.
+        if let Some(section) = sine_mods {
+            let dest = sine::mods_dir(profile_dir);
+            replace_dir(&dest)?;
+            extract_prefix(&mut archive, MODS_PREFIX, &dest)?;
+            // Sine rewrites these on startup; make sure they exist until it does.
+            for generated in ["chrome.css", "content.css"] {
+                let path = dest.join(generated);
+                if !path.exists() {
+                    std::fs::write(&path, "")
+                        .map_err(|e| format!("Failed to create {}: {e}", path.display()))?;
+                }
+            }
+            report.mod_count = section.mod_count;
+        }
+
+        if let Some(values) = sine_prefs {
+            for (name, value) in values {
+                if !prefs::is_protected(name) {
+                    set_prefs.insert(name.clone(), value.clone());
+                }
+            }
+            // A declared setting without a value is at its default on the source, so
+            // reset it here too, but only if the source declared it: settings of mods
+            // only this device has stay. Format 2 has no declared list; its mods, once
+            // restored, declare the same settings.
+            let source_declared = manifest.sine.as_ref().and_then(|s| s.declared_prefs.as_ref());
+            if source_declared.is_some() || sine_mods.is_some() {
+                clear_prefs.extend(sine::declared_prefs(profile_dir).into_iter().filter(|name| {
+                    !values.contains_key(name) && source_declared.is_none_or(|d| d.contains(name))
+                }));
+            }
+        }
+
+        let sine_restored = manifest
+            .sine
+            .as_ref()
+            .filter(|_| sine_mods.is_some() || sine_prefs.is_some());
+        if let Some(section) = sine_restored {
+            if !sine::engine_installed(profile_dir) {
+                report.warnings.push(
+                    "Sine isn't installed on this device. The restored mods and settings won't load until you install Sine."
+                        .into(),
+                );
+            } else if let (Some(local), Some(backup)) =
+                (sine::engine_version(profile_dir), &section.engine_version)
+            {
+                if &local != backup {
+                    report.warnings.push(format!(
+                        "Sine versions differ (snapshot {backup}, this device {local}). Some mods may behave differently."
+                    ));
+                }
+            }
+        }
+
+        // Extensions: storage.local, granted permissions, shortcuts.
+        let permissions_path = profile_dir.join(ext_storage::PERMISSIONS_FILE);
+        let settings_path = profile_dir.join(ext_storage::SETTINGS_FILE);
+        let mut permissions = ext_storage::read_json(&permissions_path);
+        let mut settings = ext_storage::read_json(&settings_path);
+        // Never replace a file that exists but couldn't be parsed.
+        let permissions_writable = permissions.is_some() || !permissions_path.exists();
+        let mut permissions_changed = false;
+        let mut settings_changed = false;
+        let mut storage_restored = false;
+
+        for ext in &selected {
+            if let (Some(prefix), Some(uuid)) =
+                (&ext.storage_prefix, storage_targets.get(ext.id.as_str()))
+            {
+                let dest = ext_storage::storage_local_dir(profile_dir, uuid);
+                replace_dir(&dest)?;
+                extract_prefix(&mut archive, prefix, &dest)?;
+                if let Some(source_uuid) = &ext.uuid {
+                    ext_storage::retarget_origin(&dest, source_uuid, uuid)?;
+                }
+                set_prefs.insert(ext_storage::migrated_pref(&ext.id), "true".into());
+                storage_restored = true;
+            }
+
+            if let (Some(entry), true) = (&ext.permissions, permissions_writable && restores_permissions(ext)) {
+                let root = permissions.get_or_insert_with(|| serde_json::json!({}));
+                if let Some(obj) = root.as_object_mut() {
+                    obj.insert(ext.id.clone(), entry.clone());
+                    permissions_changed = true;
+                }
+            }
+
+            if restores_shortcuts(ext) {
+                match settings.as_mut() {
+                    Some(root) => {
+                        ext_storage::merge_commands(root, &ext.id, &ext.commands);
+                        settings_changed = true;
+                    }
+                    // Firefox creates this file itself, with its own version
+                    // field, so it is never written from scratch here.
+                    None => {
+                        crate::zslog!(
+                            "[bundle] {} missing or unreadable; shortcuts for {} skipped",
+                            ext_storage::SETTINGS_FILE,
+                            ext.id
+                        );
+                        report.warnings.push(if settings_path.exists() {
+                            format!(
+                                "Keyboard shortcuts for {} weren't restored: Zen's extension settings file couldn't be read.",
+                                ext.name
+                            )
+                        } else {
+                            format!(
+                                "Keyboard shortcuts for {} weren't restored because Zen hasn't created its extension settings file yet. Open and close Zen once, then restore again.",
+                                ext.name
+                            )
+                        });
+                    }
+                }
+            }
+
+            if !installed.contains(&ext.id) {
                 report.warnings.push(format!(
-                    "Sine versions differ (snapshot {backup}, this device {local}). Some mods may behave differently."
+                    "{} isn't installed on this device yet. Its data was restored; check its settings once Zen's sync installs it.",
+                    ext.name
                 ));
             }
-        }
-    }
-
-    // Extensions: storage.local, granted permissions, shortcuts.
-    let permissions_path = profile_dir.join(ext_storage::PERMISSIONS_FILE);
-    let settings_path = profile_dir.join(ext_storage::SETTINGS_FILE);
-    let mut permissions = ext_storage::read_json(&permissions_path);
-    let mut settings = ext_storage::read_json(&settings_path);
-    // Never replace a file that exists but couldn't be parsed.
-    let permissions_writable = permissions.is_some() || !permissions_path.exists();
-    let mut permissions_changed = false;
-    let mut settings_changed = false;
-    let mut storage_restored = false;
-
-    for ext in &selected {
-        if let (Some(prefix), Some(uuid)) =
-            (&ext.storage_prefix, storage_targets.get(ext.id.as_str()))
-        {
-            let dest = ext_storage::storage_local_dir(profile_dir, uuid);
-            replace_dir(&dest)?;
-            extract_prefix(&mut archive, prefix, &dest)?;
-            if let Some(source_uuid) = &ext.uuid {
-                ext_storage::retarget_origin(&dest, source_uuid, uuid)?;
-            }
-            set_prefs.insert(ext_storage::migrated_pref(&ext.id), "true".into());
-            storage_restored = true;
+            report.extension_count += 1;
         }
 
-        if let (Some(entry), true) = (&ext.permissions, permissions_writable && restores_permissions(ext)) {
-            let root = permissions.get_or_insert_with(|| serde_json::json!({}));
-            if let Some(obj) = root.as_object_mut() {
-                obj.insert(ext.id.clone(), entry.clone());
-                permissions_changed = true;
-            }
+        if let (true, Ok(map)) = (uuid_map_changed, &uuid_map) {
+            set_prefs.insert(ext_storage::UUIDS_PREF.into(), ext_storage::uuid_map_literal(map));
         }
 
-        if restores_shortcuts(ext) {
-            match settings.as_mut() {
-                Some(root) => {
-                    ext_storage::merge_commands(root, &ext.id, &ext.commands);
-                    settings_changed = true;
-                }
-                None => crate::zslog!(
-                    "[bundle] {} missing or unreadable; shortcuts for {} skipped",
-                    ext_storage::SETTINGS_FILE,
-                    ext.id
-                ),
+        if !set_prefs.is_empty() || !clear_prefs.is_empty() {
+            std::fs::write(&prefs_path, prefs::apply(&prefs_content, &set_prefs, &clear_prefs))
+                .map_err(|e| format!("Failed to write prefs.js: {e}"))?;
+            crate::zslog!(
+                "[bundle] prefs.js: {} set, {} cleared",
+                set_prefs.len(),
+                clear_prefs.len()
+            );
+        }
+        if permissions_changed {
+            write_json(&permissions_path, permissions.as_ref())?;
+        }
+        if settings_changed {
+            write_json(&settings_path, settings.as_ref())?;
+        }
+        if storage_restored {
+            ext_storage::invalidate_quota_cache(profile_dir);
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => Ok(report),
+        Err(e) => {
+            crate::zslog!("[bundle] restore failed, rolling back: {e}");
+            match roll_back(profile_dir, safety_dir, &to_save) {
+                Ok(()) => Err(format!(
+                    "{e}\n\nNothing was changed: the files the restore had replaced were put back."
+                )),
+                Err(rb) => Err(format!(
+                    "{e}\n\nPutting the previous files back also failed: {rb}"
+                )),
             }
         }
+    }
+}
 
-        if !installed.contains(&ext.id) {
-            report.warnings.push(format!(
-                "{} isn't installed on this device yet. Its data was restored; check its settings once Zen's sync installs it.",
-                ext.name
-            ));
-        }
-        report.extension_count += 1;
+/// Undo a failed restore: put every path the restore may have touched back
+/// to its state in the safety copy, and remove what the restore created.
+fn roll_back(profile_dir: &Path, safety_dir: &Path, rels: &[String]) -> Result<(), String> {
+    let failures: Vec<String> = rels
+        .iter()
+        .filter_map(|rel| put_back(&profile_dir.join(rel), &safety_dir.join(rel)).err())
+        .collect();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
     }
+}
 
-    if let (true, Ok(map)) = (uuid_map_changed, &uuid_map) {
-        set_prefs.insert(ext_storage::UUIDS_PREF.into(), ext_storage::uuid_map_literal(map));
+fn put_back(live: &Path, saved: &Path) -> Result<(), String> {
+    if live.is_dir() {
+        std::fs::remove_dir_all(live)
+            .map_err(|e| format!("Failed to clear {}: {e}", live.display()))?;
+    } else if live.exists() {
+        std::fs::remove_file(live)
+            .map_err(|e| format!("Failed to remove {}: {e}", live.display()))?;
     }
-
-    if !set_prefs.is_empty() || !clear_prefs.is_empty() {
-        std::fs::write(&prefs_path, prefs::apply(&prefs_content, &set_prefs, &clear_prefs))
-            .map_err(|e| format!("Failed to write prefs.js: {e}"))?;
-        crate::zslog!(
-            "[bundle] prefs.js: {} set, {} cleared",
-            set_prefs.len(),
-            clear_prefs.len()
-        );
+    if saved.exists() {
+        fsutil::copy_all(saved, live)?;
     }
-    if permissions_changed {
-        write_json(&permissions_path, permissions.as_ref())?;
-    }
-    if settings_changed {
-        write_json(&settings_path, settings.as_ref())?;
-    }
-    if storage_restored {
-        ext_storage::invalidate_quota_cache(profile_dir);
-    }
-    Ok(report)
+    Ok(())
 }
 
 fn read_manifest<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<Manifest, String> {
@@ -875,6 +970,65 @@ mod tests {
         let origin = conn.query_row("SELECT origin FROM database", [], |r| r.get(0)).unwrap();
         let value = conn.query_row("SELECT value FROM object_data", [], |r| r.get(0)).unwrap();
         (origin, value)
+    }
+
+    #[test]
+    fn failed_restore_puts_everything_back() {
+        let source = tempdir().unwrap();
+        source_profile(source.path());
+        let (bytes, _) = build(source.path(), &Selection::default()).unwrap();
+
+        let target = tempdir().unwrap();
+        let t = target.path();
+        let prefs_before = format!(
+            "user_pref(\"services.sync.client.name\", \"Target PC\");\n{}\n",
+            uuids_line(&[(DARK_READER, UUID_DST)])
+        );
+        write(t, "prefs.js", &prefs_before);
+        write(t, "chrome/sine-mods/mods.json", r#"{"old":{}}"#);
+        write(t, "extensions.json", &extensions_json(&[(DARK_READER, "Dark Reader")]));
+        // A file where the extension's storage folder should be makes the
+        // storage step fail after the mods were already replaced.
+        let blocker = ext_storage::storage_local_dir(t, UUID_DST);
+        write(t, &blocker.strip_prefix(t).unwrap().to_string_lossy(), "not a folder");
+
+        let err = apply(t, &bytes, &Selection::default(), &tempdir().unwrap().path().join("safety"))
+            .unwrap_err();
+        assert!(err.contains("put back"), "{err}");
+        assert_eq!(std::fs::read_to_string(t.join("chrome/sine-mods/mods.json")).unwrap(), r#"{"old":{}}"#);
+        assert!(!t.join("chrome/sine-mods/lean").exists());
+        assert_eq!(std::fs::read_to_string(t.join(PREFS_FILE)).unwrap(), prefs_before);
+        assert_eq!(std::fs::read_to_string(&blocker).unwrap(), "not a folder");
+    }
+
+    #[test]
+    fn unreadable_prefs_js_stops_the_restore() {
+        let source = tempdir().unwrap();
+        source_profile(source.path());
+        let (bytes, _) = build(source.path(), &Selection::default()).unwrap();
+
+        let target = tempdir().unwrap();
+        let t = target.path();
+        // Not valid UTF-8.
+        let raw = b"user_pref(\"a\", \"\xff\xfe\");\n".to_vec();
+        std::fs::write(t.join(PREFS_FILE), &raw).unwrap();
+
+        let err = apply(t, &bytes, &Selection::default(), tempdir().unwrap().path()).unwrap_err();
+        assert!(err.contains("prefs.js"), "{err}");
+        assert_eq!(std::fs::read(t.join(PREFS_FILE)).unwrap(), raw);
+    }
+
+    #[test]
+    fn sine_settings_are_backed_up_without_mods() {
+        let source = tempdir().unwrap();
+        let s = source.path();
+        write(s, "prefs.js", "user_pref(\"sine.allow-unsafe-js\", true);\n");
+        write(s, "chrome/JS/sine.sys.mjs", "");
+        write(s, "chrome/JS/core/settings.json", r#"[{"property":"sine.allow-unsafe-js"}]"#);
+        let (_, manifest) = build(s, &Selection::default()).unwrap();
+        let sine = manifest.sine.unwrap();
+        assert!(!sine.mods_included, "no mods must never be restored as an empty folder");
+        assert_eq!(sine.prefs.unwrap().len(), 1);
     }
 
     #[test]
@@ -1356,7 +1510,7 @@ mod tests {
                 "user_pref(\"gfx.blacklist.layers.direct2d\", 3);\n",
             ),
         );
-        let summary = summarize(dir.path(), &Selection::default());
+        let summary = summarize(dir.path(), &Selection::default()).unwrap();
         assert_eq!(summary.shortcut_count, 1);
         assert_eq!(summary.pref_count, 1);
     }

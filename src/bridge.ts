@@ -28,8 +28,9 @@ export const bridge = {
   /** All devices' snapshots, newest first. */
   getSnapshots: () => invoke<SnapshotInfo[]>("get_snapshots_cmd"),
 
-  restoreSnapshot: (index: number, machineId: string) =>
-    invoke<RestoreReport>("restore_snapshot_cmd", { index, machineId }),
+  /** `pushedAt` is the snapshot's time as listed; the backend refuses if the slot now holds another. */
+  restoreSnapshot: (index: number, machineId: string, pushedAt: string) =>
+    invoke<RestoreReport>("restore_snapshot_cmd", { index, machineId, pushedAt }),
 
   setMachineName: (name: string) =>
     invoke<void>("set_machine_name_cmd", { name }),

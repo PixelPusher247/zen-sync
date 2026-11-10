@@ -47,20 +47,65 @@ impl Default for LocalState {
 impl LocalState {
     pub fn load(config_dir: &Path) -> Self {
         let path = config_dir.join(STATE_FILE);
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Self::default();
+        };
+        match serde_json::from_str(&text) {
+            Ok(state) => state,
+            Err(e) => {
+                // Keep the damaged file for inspection instead of silently
+                // overwriting it with defaults on the next save.
+                let kept = config_dir.join(format!("{STATE_FILE}.damaged"));
+                let _ = std::fs::copy(&path, &kept);
+                crate::zslog!("[state] {STATE_FILE} unreadable ({e}); kept as {}", kept.display());
+                Self::default()
+            }
+        }
     }
 
+    /// Write atomically: a crash mid-save leaves the previous file, never a
+    /// truncated one.
     pub fn save(&self, config_dir: &Path) -> Result<(), String> {
         std::fs::create_dir_all(config_dir)
             .map_err(|e| format!("Failed to create config dir: {e}"))?;
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Serialize error: {e}"))?;
-        std::fs::write(config_dir.join(STATE_FILE), json)
-            .map_err(|e| format!("Failed to write state: {e}"))
+        let tmp = config_dir.join(format!("{STATE_FILE}.tmp"));
+        std::fs::write(&tmp, json).map_err(|e| format!("Failed to write state: {e}"))?;
+        std::fs::rename(&tmp, config_dir.join(STATE_FILE))
+            .map_err(|e| format!("Failed to save state: {e}"))
     }
+
+    /// The id this device's snapshots are filed under: the one frozen by a
+    /// rename if there is one, otherwise derived from the current name.
+    pub fn machine_id(&self) -> String {
+        self.machine_id
+            .clone()
+            .unwrap_or_else(|| derive_machine_id(&self.machine_name))
+    }
+}
+
+/// Asset-name-safe id for a device name: lowercase ASCII letters and digits,
+/// with every other character as a dash. GitHub renames asset files with
+/// other characters, which would make the snapshot impossible to find again.
+/// For ASCII names this matches the ids of earlier versions, so existing
+/// snapshots stay with their device. A name with no ASCII letters or digits
+/// gets a stable id from its hash.
+pub fn derive_machine_id(name: &str) -> String {
+    let id: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let id = id.trim_matches('-').to_string();
+    if !id.is_empty() {
+        return id;
+    }
+    // FNV-1a: stable across builds and platforms, unlike std's hasher.
+    let hash = name
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+    format!("device-{:08x}", hash as u32)
 }
 
 fn default_machine_name() -> String {
@@ -118,8 +163,29 @@ mod tests {
         assert_eq!(s.machine_name, "PC");
         // No stored id: it keeps following the name, as before.
         assert_eq!(s.machine_id, None);
+        assert_eq!(s.machine_id(), "pc");
         assert!(s.extension_overrides.is_empty());
         assert_eq!(s.sync_options, SyncOptions::default());
+    }
+
+    #[test]
+    fn machine_ids_are_ascii_and_match_earlier_versions() {
+        assert_eq!(derive_machine_id("Picolaptop-007"), "picolaptop-007");
+        assert_eq!(derive_machine_id("Work  Laptop!"), "work--laptop");
+        assert_eq!(derive_machine_id("Büro-PC"), "b-ro-pc");
+        let cyrillic = derive_machine_id("Ноутбук");
+        assert!(cyrillic.starts_with("device-"));
+        assert_eq!(cyrillic, derive_machine_id("Ноутбук"));
+        assert_ne!(cyrillic, derive_machine_id("Компьютер"));
+    }
+
+    #[test]
+    fn damaged_state_is_kept_and_defaults_load() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(STATE_FILE), r#"{"machine_name":"PC","snapsh"#).unwrap();
+        let s = LocalState::load(dir.path());
+        assert_eq!(s.snapshot_count, 3);
+        assert!(dir.path().join(format!("{STATE_FILE}.damaged")).exists());
     }
 
     #[test]

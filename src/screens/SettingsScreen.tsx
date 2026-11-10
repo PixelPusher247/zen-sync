@@ -4,6 +4,8 @@ import { hasExtensionData } from "../format";
 import type { AppStatus, Screen, SyncOptions } from "../types";
 import { useConfirm } from "../components/ConfirmDialog";
 import Switch from "../components/Switch";
+import { allSaved, onBackgroundSaveFailure } from "../hooks/useAutosave";
+import { useOperations } from "../hooks/useOperations";
 
 interface Props {
   status: AppStatus;
@@ -73,49 +75,89 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
   const [version, setVersion] = useState<string | null>(null);
   const [extensionCount, setExtensionCount] = useState<Count | null>(null);
   const [prefCount, setPrefCount] = useState<Count | null>(null);
+  const ops = useOperations();
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // The name waiting for the debounce, saved at once if the screen closes.
+  const pendingNameRef = useRef<string | null>(null);
+  const mountedRef = useRef(true);
 
-  // Shown next to the picker links; the links work without them.
+  // Shown next to the picker links; the links work without them. A picker
+  // may still be saving its last change, so wait for that first.
   useEffect(() => {
-    bridge.getVersion().then(setVersion).catch(() => {});
-    bridge
-      .getExtensions()
-      .then((list) => setExtensionCount({ selected: list.filter((e) => e.synced).length, total: list.length }))
-      .catch(() => {});
-    bridge
-      .getPrefs()
-      .then((list) => setPrefCount({ selected: list.filter((p) => p.synced).length, total: list.length }))
-      .catch(() => {});
+    let active = true;
+    bridge.getVersion().then((v) => active && setVersion(v)).catch(() => {});
+    allSaved().then(() => {
+      if (!active) return;
+      bridge
+        .getExtensions()
+        .then((list) => active && setExtensionCount({ selected: list.filter((e) => e.synced).length, total: list.length }))
+        .catch(() => {});
+      bridge
+        .getPrefs()
+        .then((list) => active && setPrefCount({ selected: list.filter((p) => p.synced).length, total: list.length }))
+        .catch(() => {});
+    });
+    const unsubscribe = onBackgroundSaveFailure((message) =>
+      setError(`Your last selection change wasn't saved: ${message}`),
+    );
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      // Leaving within the debounce must not drop the new name.
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      if (pendingNameRef.current !== null) void saveMachineName(pendingNameRef.current);
+    };
+    // Runs on unmount only; saveMachineName reads nothing that goes stale.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const nameEmpty = machineName.trim() === "";
+
+  async function saveMachineName(name: string) {
+    pendingNameRef.current = null;
+    try {
+      await bridge.setMachineName(name);
+      onStatusChange(await bridge.getStatus());
+      if (!mountedRef.current) return;
+      setMachineNameSaved(true);
+      setTimeout(() => mountedRef.current && setMachineNameSaved(false), 2000);
+    } catch (e) {
+      if (mountedRef.current) setError(String(e));
+    }
+  }
 
   function handleMachineNameChange(value: string) {
     setMachineName(value);
     setMachineNameSaved(false);
     if (debounceRef.current) clearTimeout(debounceRef.current);
     // Backups are filed under the name, so an empty one is never saved.
-    if (value.trim() === "") return;
-    debounceRef.current = setTimeout(async () => {
-      try {
-        await bridge.setMachineName(value.trim());
-        const s = await bridge.getStatus();
-        onStatusChange(s);
-        setMachineNameSaved(true);
-        setTimeout(() => setMachineNameSaved(false), 2000);
-      } catch (e) {
-        setError(String(e));
-      }
+    if (value.trim() === "") {
+      pendingNameRef.current = null;
+      return;
+    }
+    pendingNameRef.current = value.trim();
+    debounceRef.current = setTimeout(() => {
+      debounceRef.current = null;
+      if (pendingNameRef.current !== null) void saveMachineName(pendingNameRef.current);
     }, 600);
   }
 
   async function handleSnapshotCountChange(value: number) {
+    const previous = snapshotCount;
     setSnapshotCount(value);
     try {
       await bridge.setSnapshotCount(value);
       const s = await bridge.getStatus();
       onStatusChange(s);
     } catch (e) {
+      setSnapshotCount(previous);
       setError(String(e));
     }
   }
@@ -147,6 +189,7 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
   }
 
   async function handleDisconnect() {
+    if (ops.busy) return;
     const ok = await confirm({
       title: "Disconnect from GitHub?",
       message: "Your backup repo and its snapshots are not deleted. You can reconnect at any time.",
@@ -315,7 +358,8 @@ export default function SettingsScreen({ status, onStatusChange, onNavigate }: P
         <button
           type="button"
           onClick={handleDisconnect}
-          disabled={disconnecting}
+          disabled={disconnecting || ops.busy}
+          title={ops.busy ? "Wait for the backup or restore to finish" : undefined}
           className="btn-danger text-xs w-full"
         >
           {disconnecting ? "Disconnecting…" : "Disconnect GitHub"}

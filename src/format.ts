@@ -20,19 +20,28 @@ export function formatDate(iso: string | null): string {
   });
 }
 
-/** "3 hours ago" for the last week, the plain date beyond that. */
-export function formatRelative(iso: string | null): string {
+/** Whole calendar days between two local dates (ignoring the time of day). */
+function calendarDaysBetween(earlier: Date, later: Date): number {
+  const start = new Date(earlier.getFullYear(), earlier.getMonth(), earlier.getDate());
+  const end = new Date(later.getFullYear(), later.getMonth(), later.getDate());
+  return Math.round((end.getTime() - start.getTime()) / 86_400_000);
+}
+
+/**
+ * "3 hours ago" within the same day, "Yesterday" / "3 days ago" by calendar
+ * day for the last week, the plain date beyond that.
+ */
+export function formatRelative(iso: string | null, now: Date = new Date()): string {
   if (!iso) return "Never";
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
-  const minutes = Math.round((Date.now() - d.getTime()) / 60_000);
+  const minutes = Math.floor((now.getTime() - d.getTime()) / 60_000);
   if (minutes < 1) return "Just now";
   const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
-  const hours = Math.round(minutes / 60);
-  const days = Math.round(hours / 24);
+  const days = calendarDaysBetween(d, now);
   let text: string;
   if (minutes < 60) text = rtf.format(-minutes, "minute");
-  else if (hours < 24) text = rtf.format(-hours, "hour");
+  else if (days === 0) text = rtf.format(-Math.floor(minutes / 60), "hour");
   else if (days <= 7) text = rtf.format(-days, "day");
   else return formatDate(iso);
   // "yesterday" stands alone in the UI, so it starts with a capital.

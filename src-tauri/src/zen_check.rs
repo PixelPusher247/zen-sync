@@ -24,8 +24,10 @@ pub fn is_running() -> bool {
         }
         match (&my_uid, p.user_id()) {
             (Some(mine), Some(theirs)) => mine == theirs,
-            (None, None) => true,
-            _ => false,
+            // An owner that can't be read (e.g. Zen running as administrator)
+            // counts as running: wrongly blocking is safe, wrongly allowing
+            // a restore into an open profile is not.
+            _ => true,
         }
     })
 }
@@ -35,5 +37,5 @@ pub fn is_running() -> bool {
 pub async fn is_zen_running() -> bool {
     tauri::async_runtime::spawn_blocking(is_running)
         .await
-        .unwrap_or(false)
+        .unwrap_or(true)
 }

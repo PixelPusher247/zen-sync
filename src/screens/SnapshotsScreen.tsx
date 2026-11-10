@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { useRefreshOnFocus } from "../hooks/useRefreshOnFocus";
 import { bridge } from "../bridge";
 import { formatDate } from "../format";
 import type { AppStatus, SnapshotInfo } from "../types";
@@ -17,18 +18,24 @@ export default function SnapshotsScreen({ status }: Props) {
   const zenRunning = useZenRunning();
   const ops = useOperations();
 
+  // Only the newest request may update the list; an older one finishing
+  // later would put back a list without the latest snapshot.
+  const requestRef = useRef(0);
   const load = useCallback(() => {
+    const request = ++requestRef.current;
     setLoading(true);
     setLoadError(null);
     bridge
       .getSnapshots()
-      .then(setSnapshots)
-      .catch((e) => setLoadError(String(e)))
-      .finally(() => setLoading(false));
+      .then((list) => request === requestRef.current && setSnapshots(list))
+      .catch((e) => request === requestRef.current && setLoadError(String(e)))
+      .finally(() => request === requestRef.current && setLoading(false));
   }, []);
 
-  // Also re-run after a backup, which adds a snapshot.
+  // Also re-run after a backup, which adds a snapshot, and when the window
+  // regains focus, since other devices may have backed up meanwhile.
   useEffect(load, [load, ops.revision]);
+  useRefreshOnFocus(load);
 
   return (
     <div className="p-5 flex flex-col gap-4 animate-fade-in">

@@ -6,7 +6,6 @@ import {
   useId,
   useRef,
   useState,
-  type KeyboardEvent,
   type ReactNode,
 } from "react";
 
@@ -43,7 +42,16 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
   const [pending, setPending] = useState<Pending | null>(null);
 
   const confirm = useCallback<Confirm>(
-    (options) => new Promise((resolve) => setPending({ options, resolve })),
+    (options) =>
+      new Promise((resolve) =>
+        setPending((previous) => {
+          // Only one dialog shows at a time. A dialog that gets replaced
+          // counts as cancelled, so whoever was waiting on it carries on
+          // instead of waiting forever.
+          previous?.resolve(false);
+          return { options, resolve };
+        })
+      ),
     []
   );
 
@@ -82,18 +90,25 @@ function ConfirmDialog({
     (danger || cautious ? cancelRef : confirmRef).current?.focus();
   }, [danger, cautious]);
 
-  function handleKeyDown(e: KeyboardEvent) {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      onClose(false);
-    } else if (e.key === "Tab") {
-      // Keep focus inside the dialog.
-      const buttons = [cancelRef.current, confirmRef.current];
-      const next = buttons[(buttons.indexOf(document.activeElement as HTMLButtonElement) + 1) % 2];
-      e.preventDefault();
-      next?.focus();
+  // On the document, not the overlay: clicking the message text moves focus
+  // out of the buttons, and Escape and the focus trap must still work then.
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose(false);
+      } else if (e.key === "Tab") {
+        const buttons = [cancelRef.current, confirmRef.current];
+        const at = buttons.indexOf(document.activeElement as HTMLButtonElement);
+        // Two buttons, so Tab and Shift+Tab both mean "the other one".
+        const next = at === -1 ? buttons[0] : buttons[(at + 1) % 2];
+        e.preventDefault();
+        next?.focus();
+      }
     }
-  }
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
 
   return (
     <div
@@ -101,7 +116,6 @@ function ConfirmDialog({
       onMouseDown={(e) => {
         if (!panelRef.current?.contains(e.target as Node)) onClose(false);
       }}
-      onKeyDown={handleKeyDown}
     >
       <div
         ref={panelRef}

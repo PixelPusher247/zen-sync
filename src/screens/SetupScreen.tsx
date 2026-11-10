@@ -5,6 +5,8 @@ import { FloatingTitleBar } from "../components/WindowControls";
 
 interface Props {
   onConnected: (status: AppStatus) => void;
+  /** A saved sign-in is being restored, e.g. waiting for the network. */
+  reconnecting?: boolean;
 }
 
 const POINTS = [
@@ -22,7 +24,7 @@ function GitHubMark() {
   );
 }
 
-export default function SetupScreen({ onConnected }: Props) {
+export default function SetupScreen({ onConnected, reconnecting = false }: Props) {
   const [state, setState] = useState<"idle" | "connecting" | "error">("idle");
   const [error, setError] = useState<string | null>(null);
   // Only the newest attempt may report a failure; a cancelled one stays quiet.
@@ -71,6 +73,19 @@ export default function SetupScreen({ onConnected }: Props) {
             </li>
           ))}
         </ul>
+
+        {reconnecting && state === "idle" && (
+          <div
+            role="status"
+            className="w-full flex items-center gap-2.5 p-3 bg-accent/10 border border-accent/20 rounded-xl text-xs text-white animate-fade-in"
+          >
+            <div className="w-3.5 h-3.5 shrink-0 border-2 border-accent/30 border-t-accent rounded-full animate-spin" />
+            <span>
+              Reconnecting to GitHub with your saved sign-in. This retries for a
+              few minutes while the network comes up.
+            </span>
+          </div>
+        )}
 
         {error && (
           <div role="alert" className="w-full p-3 bg-danger/10 border border-danger/20 rounded-xl text-xs text-danger animate-fade-in">

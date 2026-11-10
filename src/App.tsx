@@ -42,12 +42,24 @@ export default function App() {
     const unlisten = listen<UpdateInfo>("update-available", (e) => {
       setUpdate(e.payload);
     });
+    // The backend may finish restoring the saved sign-in before this
+    // listener is attached, so check again once it is.
     const unlistenRestored = listen("github-restored", () => refreshStatus());
+    unlistenRestored.then(() => refreshStatus());
     return () => {
       unlisten.then((f) => f());
       unlistenRestored.then((f) => f());
     };
   }, [refreshStatus]);
+
+  // While a saved sign-in is still being restored, keep checking: covers a
+  // missed event and shows the dashboard as soon as GitHub is reachable.
+  const reconnecting = status?.reconnecting === true;
+  useEffect(() => {
+    if (!reconnecting) return;
+    const id = setInterval(refreshStatus, 3000);
+    return () => clearInterval(id);
+  }, [reconnecting, refreshStatus]);
 
   if (loading) {
     return (
@@ -65,6 +77,7 @@ export default function App() {
   if (!status?.connected) {
     return (
       <SetupScreen
+        reconnecting={reconnecting}
         onConnected={(s) => {
           setStatus(s);
           setScreen("dashboard");

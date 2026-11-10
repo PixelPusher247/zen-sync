@@ -41,6 +41,29 @@ fn epoch_to_iso(epoch: u64) -> String {
     format!("{y:04}-{mo:02}-{:02}T{hour:02}:{min:02}:{sec:02}Z", days + 1)
 }
 
+/// How often a backup tries to save the backup list when it keeps changing.
+const METADATA_WRITE_ATTEMPTS: u32 = 3;
+
+/// Add a just-uploaded snapshot to this machine's list. Returns the slots
+/// that dropped out of it, whose assets can be deleted.
+fn record_snapshot(
+    metadata: &mut SyncMetadata,
+    machine_id: &str,
+    entry: SnapshotEntry,
+    max_snapshots: u8,
+) -> Vec<u8> {
+    if let Some(mm) = metadata.machines.iter_mut().find(|m| m.machine_id == machine_id) {
+        return mm.record(entry, max_snapshots);
+    }
+    metadata.machines.push(MachineMetadata {
+        machine_id: machine_id.to_string(),
+        current_index: entry.index,
+        snapshots: vec![entry],
+        max_snapshots,
+    });
+    Vec::new()
+}
+
 /// Back up Sine mods and extension data to GitHub.
 /// Returns the ISO timestamp of the backup.
 pub async fn backup(
@@ -106,21 +129,28 @@ pub async fn backup(
         size_bytes: encrypted.len() as u64,
     };
 
-    // Update or insert machine metadata
-    let dropped = if let Some(mm) = metadata.machines.iter_mut().find(|m| m.machine_id == machine_id) {
-        mm.record(new_entry, max_snapshots)
-    } else {
-        metadata.machines.push(MachineMetadata {
-            machine_id: machine_id.to_string(),
-            snapshots: vec![new_entry],
-            max_snapshots,
-            current_index: index,
-        });
-        Vec::new()
-    };
-
     on_progress("Saving backup list…");
-    client.write_metadata(&metadata, sha.as_deref()).await?;
+    // Another device may save the list between our read and write. GitHub
+    // then refuses the write, and the entry is applied to a fresh copy.
+    let mut sha = sha;
+    let mut attempts = 0;
+    let dropped = loop {
+        let dropped = record_snapshot(&mut metadata, machine_id, new_entry.clone(), max_snapshots);
+        if client.write_metadata(&metadata, sha.as_deref()).await? {
+            break dropped;
+        }
+        attempts += 1;
+        if attempts >= METADATA_WRITE_ATTEMPTS {
+            return Err(
+                "The backup was uploaded, but the backup list kept changing on GitHub and couldn't be saved. Back up again."
+                    .into(),
+            );
+        }
+        (metadata, sha) = match client.read_metadata().await? {
+            Some(m) => (m.metadata, Some(m.sha)),
+            None => (SyncMetadata::default(), None),
+        };
+    };
 
     // Snapshots that fell out of the list, e.g. after "Snapshots to keep" was
     // lowered. Removed only once the list no longer points at them.
@@ -140,20 +170,50 @@ pub async fn backup(
 }
 
 /// Restore a snapshot from GitHub into the local profile.
+///
+/// `expected_pushed_at` is the time of the snapshot the user picked. Slots are
+/// reused, so if the slot now holds a different snapshot the restore stops
+/// instead of applying something the user didn't choose.
 pub async fn restore(
     client: &GitHubClient,
     machine_id: &str,
     index: u8,
+    expected_pushed_at: Option<&str>,
     selection: Selection,
     safety_root: PathBuf,
     on_progress: impl Fn(&str) + Send,
 ) -> Result<RestoreReport, String> {
+    if let Some(expected) = expected_pushed_at {
+        on_progress("Checking the backup list…");
+        let current = client.read_metadata().await?.and_then(|m| {
+            m.metadata
+                .machines
+                .into_iter()
+                .find(|mm| mm.machine_id == machine_id)?
+                .snapshots
+                .into_iter()
+                .find(|s| s.index == index)
+                .map(|s| s.pushed_at)
+        });
+        if current.as_deref() != Some(expected) {
+            return Err(
+                "This snapshot was replaced by a newer backup since the list was loaded. Refresh History and pick again."
+                    .into(),
+            );
+        }
+    }
+
     on_progress("Downloading…");
     crate::zslog!("[sync] restore: fetching machine '{machine_id}' slot {index}");
     let encrypted = client.download_snapshot(machine_id, index).await?;
 
     on_progress("Decrypting…");
     let archive = crypto::decrypt(&encrypted, &client.encryption_key)?;
+
+    // Zen may have been opened while the snapshot downloaded.
+    if crate::zen_check::is_running() {
+        return Err("Zen Browser was opened during the restore. Close it and try again; nothing was changed.".into());
+    }
 
     let profile_dir = profile::find_zen_profile()
         .ok_or("Zen profile folder not found.")?;
@@ -166,7 +226,7 @@ pub async fn restore(
         prune_safety_copies(&safety_root);
         result.map_err(|e| {
             if safety_dir.exists() {
-                format!("{e}\n\nFiles from before the restore were saved to {}", safety_dir.display())
+                format!("{e}\n\nA copy of the files from before the restore is in {}", safety_dir.display())
             } else {
                 e
             }
@@ -262,6 +322,41 @@ mod tests {
         assert!(deleted.iter().all(|i| !slots(&mm).contains(i)));
         assert_eq!(slots(&mm).len(), 2);
         assert_eq!(deleted.len(), 1);
+    }
+
+    #[test]
+    fn raising_the_limit_again_uses_free_slots() {
+        let mut mm = MachineMetadata {
+            machine_id: "pc".into(),
+            snapshots: vec![entry(2), entry(1), entry(0)],
+            max_snapshots: 3,
+            current_index: 2,
+        };
+        // Lower to 2: one slot drops out.
+        simulate(&mut mm, 1, 2);
+        assert_eq!(slots(&mm).len(), 2);
+        // Raise back to 3: the next backups fill the free slot, then rotate,
+        // instead of overwriting the newest snapshot every time.
+        let mut written = Vec::new();
+        for _ in 0..3 {
+            let index = mm.next_index(3);
+            written.push(index);
+            mm.record(entry(index), 3);
+        }
+        assert_eq!(slots(&mm).len(), 3);
+        let mut distinct = written.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 3, "slots written: {written:?}");
+    }
+
+    #[test]
+    fn a_new_entry_is_recorded_for_a_new_machine() {
+        let mut metadata = SyncMetadata::default();
+        let dropped = record_snapshot(&mut metadata, "pc", entry(0), 3);
+        assert!(dropped.is_empty());
+        assert_eq!(metadata.machines.len(), 1);
+        assert_eq!(metadata.machines[0].current_index, 0);
     }
 
     #[test]

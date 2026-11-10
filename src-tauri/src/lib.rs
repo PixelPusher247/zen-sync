@@ -23,7 +23,18 @@ struct AppState {
     github_client: Option<Arc<github::GitHubClient>>,
     local_state: local_state::LocalState,
     config_dir: std::path::PathBuf,
+    /// A saved sign-in is being restored in the background.
+    reconnecting: bool,
 }
+
+/// Held for the whole of a backup or restore, so two can never run at once,
+/// whatever the window does in the meantime.
+struct OperationLock(tokio::sync::Mutex<()>);
+
+/// How often, and how far apart, startup retries a saved sign-in that
+/// failed for a reason other than GitHub rejecting it (e.g. no network yet).
+const RECONNECT_ATTEMPTS: u32 = 20;
+const RECONNECT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 impl AppState {
     fn selection(&self) -> bundle::Selection {
@@ -34,21 +45,18 @@ impl AppState {
         }
     }
 
-    /// The id this device's snapshots are filed under: the one frozen by a
-    /// rename if there is one, otherwise derived from the current name.
     fn machine_id(&self) -> String {
-        if let Some(id) = &self.local_state.machine_id {
-            return id.clone();
-        }
-        // URL-safe, lowercase form of the machine name
-        self.local_state
-            .machine_name
-            .to_lowercase()
-            .chars()
-            .map(|c| if c.is_alphanumeric() { c } else { '-' })
-            .collect::<String>()
-            .trim_matches('-')
-            .to_string()
+        self.local_state.machine_id()
+    }
+
+    /// Change the saved settings: applied to a copy, saved, and only then
+    /// adopted, so a failed save leaves memory and disk in agreement.
+    fn update_local(&mut self, change: impl FnOnce(&mut local_state::LocalState)) -> Result<(), String> {
+        let mut next = self.local_state.clone();
+        change(&mut next);
+        next.save(&self.config_dir)?;
+        self.local_state = next;
+        Ok(())
     }
 }
 
@@ -89,12 +97,15 @@ pub fn run() {
             let config_dir = app.path().app_config_dir().unwrap_or_default();
             let ls = local_state::LocalState::load(&config_dir);
 
+            let has_token = github::has_stored_token();
             let state = Arc::new(Mutex::new(AppState {
                 github_client: None,
                 local_state: ls,
                 config_dir,
+                reconnecting: has_token,
             }));
             app.manage(state.clone());
+            app.manage(OperationLock(tokio::sync::Mutex::new(())));
 
             let update_store = Arc::new(UpdateStore::new());
             app.manage(update_store.clone());
@@ -116,32 +127,24 @@ pub fn run() {
             round_corners(&window);
 
             // Show window on first run (no GitHub token yet)
-            if !github::has_stored_token() {
-                window.show().unwrap();
+            if !has_token {
+                let _ = window.show();
                 let _ = window.set_focus();
             }
 
             // Restore GitHub client from keychain in background
-            {
+            if has_token {
                 let state_clone = state.clone();
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    match github::GitHubClient::from_keychain().await {
-                        Ok(Some(client)) => {
-                            state_clone.lock().unwrap().github_client =
-                                Some(Arc::new(client));
-                            crate::zslog!("[app] GitHub client restored from keychain");
-                            let _ = app_handle.emit("github-restored", ());
-                            // Show window after successful restore if connected
-                            if let Some(w) = app_handle.get_webview_window("main") {
-                                let _ = w.show();
-                                let _ = w.set_focus();
-                            }
-                        }
-                        Ok(None) => {
-                            crate::zslog!("[app] no stored GitHub token");
-                        }
-                        Err(e) => crate::zslog!("[app] GitHub restore failed: {e}"),
+                    restore_saved_sign_in(&state_clone, &app_handle).await;
+                    state_clone.lock().unwrap().reconnecting = false;
+                    let _ = app_handle.emit("github-restored", ());
+                    // The window always appears, connected or not: the app
+                    // has no tray, so a hidden window would be unreachable.
+                    if let Some(w) = app_handle.get_webview_window("main") {
+                        let _ = w.show();
+                        let _ = w.set_focus();
                     }
                 });
             }
@@ -183,6 +186,38 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running zen-sync");
+}
+
+/// Restore the saved GitHub sign-in, retrying while it fails for reasons
+/// other than GitHub rejecting it, e.g. when Windows starts the app at login
+/// before the network is up. The window is shown after the first failure so
+/// the user sees the app reconnecting instead of nothing.
+async fn restore_saved_sign_in(state: &Arc<Mutex<AppState>>, app: &tauri::AppHandle) {
+    for attempt in 1..=RECONNECT_ATTEMPTS {
+        match github::GitHubClient::from_keychain().await {
+            Ok(Some(client)) => {
+                state.lock().unwrap().github_client = Some(Arc::new(client));
+                crate::zslog!("[app] GitHub client restored from keychain");
+                return;
+            }
+            Ok(None) => {
+                crate::zslog!("[app] saved GitHub sign-in is no longer valid");
+                return;
+            }
+            Err(e) => {
+                crate::zslog!("[app] GitHub restore failed (attempt {attempt}): {e}");
+                if attempt == 1 {
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                    }
+                }
+                if attempt < RECONNECT_ATTEMPTS {
+                    tokio::time::sleep(RECONNECT_INTERVAL).await;
+                }
+            }
+        }
+    }
 }
 
 /// Frameless windows get square corners by default. Windows 11 rounds them on
@@ -278,6 +313,8 @@ struct AppStatusPayload {
     snapshot_count: u8,
     autostart_enabled: bool,
     sync_options: bundle::SyncOptions,
+    /// A saved sign-in is still being restored (e.g. waiting for the network).
+    reconnecting: bool,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -311,6 +348,7 @@ fn get_status_cmd(
         snapshot_count: s.local_state.snapshot_count,
         autostart_enabled,
         sync_options: s.local_state.sync_options.clone(),
+        reconnecting: s.reconnecting && s.github_client.is_none(),
     }
 }
 
@@ -336,19 +374,23 @@ fn disconnect_github_cmd(
     Ok(())
 }
 
+const OPERATION_BUSY: &str = "Another backup or restore is still running. Wait for it to finish.";
+
 #[tauri::command]
 async fn backup_now_cmd(
     delete_legacy: bool,
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    lock: tauri::State<'_, OperationLock>,
 ) -> Result<(), String> {
+    let _operation = lock.0.try_lock().map_err(|_| OPERATION_BUSY)?;
     if zen_check::is_running() {
         return Err(
             "Zen Browser is open. Close it completely before backing up.".into(),
         );
     }
 
-    let (client, machine_name, machine_id, max_snapshots, selection, config_dir) = {
+    let (client, machine_name, machine_id, max_snapshots, selection) = {
         let s = state.lock().unwrap();
         let c = s.github_client.clone().ok_or("Not connected to GitHub")?;
         (
@@ -357,7 +399,6 @@ async fn backup_now_cmd(
             s.machine_id(),
             s.local_state.snapshot_count,
             s.selection(),
-            s.config_dir.clone(),
         )
     };
 
@@ -377,8 +418,11 @@ async fn backup_now_cmd(
 
     {
         let mut s = state.lock().unwrap();
-        s.local_state.last_backup_at = Some(pushed_at);
-        let _ = s.local_state.save(&config_dir);
+        if let Err(e) = s.update_local(|ls| ls.last_backup_at = Some(pushed_at.clone())) {
+            // The backup itself is stored; only the local "last backup" time is stale.
+            crate::zslog!("[app] couldn't record last backup time: {e}");
+            s.local_state.last_backup_at = Some(pushed_at);
+        }
     }
     let _ = app.emit("sync-updated", ());
     Ok(())
@@ -405,7 +449,7 @@ fn get_backup_summary_cmd(
     let profile_dir = profile::find_zen_profile()
         .ok_or("Zen profile folder not found. Is Zen Browser installed?")?;
     let selection = state.lock().unwrap().selection();
-    Ok(bundle::summarize(&profile_dir, &selection))
+    bundle::summarize(&profile_dir, &selection)
 }
 
 #[tauri::command]
@@ -448,9 +492,12 @@ async fn get_snapshots_cmd(
 async fn restore_snapshot_cmd(
     index: u8,
     machine_id: String,
+    pushed_at: Option<String>,
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    lock: tauri::State<'_, OperationLock>,
 ) -> Result<bundle::RestoreReport, String> {
+    let _operation = lock.0.try_lock().map_err(|_| OPERATION_BUSY)?;
     if zen_check::is_running() {
         return Err(
             "Zen Browser is open. Close it completely before restoring.".into(),
@@ -464,9 +511,17 @@ async fn restore_snapshot_cmd(
     };
 
     let app_p = app.clone();
-    let report = sync::restore(&client, &machine_id, index, selection, safety_root, move |msg| {
-        let _ = app_p.emit("sync-progress", msg);
-    })
+    let report = sync::restore(
+        &client,
+        &machine_id,
+        index,
+        pushed_at.as_deref(),
+        selection,
+        safety_root,
+        move |msg| {
+            let _ = app_p.emit("sync-progress", msg);
+        },
+    )
     .await?;
 
     let _ = app.emit("sync-updated", ());
@@ -478,16 +533,21 @@ fn set_machine_name_cmd(
     name: String,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<(), String> {
-    let mut s = state.lock().unwrap();
-    // Snapshots are filed under an id derived from the name. Once this device
-    // has backups, keep that id through the rename so they stay with it.
-    if s.local_state.machine_id.is_none() && s.local_state.last_backup_at.is_some() {
-        let id = s.machine_id();
-        s.local_state.machine_id = Some(id);
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("The device name can't be empty.".into());
     }
-    s.local_state.machine_name = name;
-    let config_dir = s.config_dir.clone();
-    s.local_state.save(&config_dir)
+    let mut s = state.lock().unwrap();
+    // Snapshots are filed under an id derived from the name. Keep the current
+    // id through any rename, so snapshots made before it (or one uploading
+    // right now, or ones from a reinstall) stay with this device.
+    let id = s.machine_id();
+    s.update_local(|ls| {
+        if ls.machine_id.is_none() {
+            ls.machine_id = Some(id);
+        }
+        ls.machine_name = name;
+    })
 }
 
 #[tauri::command]
@@ -495,10 +555,10 @@ fn set_snapshot_count_cmd(
     count: u8,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<(), String> {
-    let mut s = state.lock().unwrap();
-    s.local_state.snapshot_count = count.clamp(1, 10);
-    let config_dir = s.config_dir.clone();
-    s.local_state.save(&config_dir)
+    state
+        .lock()
+        .unwrap()
+        .update_local(|ls| ls.snapshot_count = count.clamp(1, 10))
 }
 
 #[tauri::command]
@@ -506,10 +566,7 @@ fn set_sync_options_cmd(
     options: bundle::SyncOptions,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<(), String> {
-    let mut s = state.lock().unwrap();
-    s.local_state.sync_options = options;
-    let config_dir = s.config_dir.clone();
-    s.local_state.save(&config_dir)
+    state.lock().unwrap().update_local(|ls| ls.sync_options = options)
 }
 
 
@@ -564,10 +621,9 @@ fn set_extension_selection_cmd(
     let profile_dir = profile::find_zen_profile()
         .ok_or("Zen profile folder not found. Is Zen Browser installed?")?;
     let installed = extensions::list_extensions(&profile_dir)?;
-    let mut s = state.lock().unwrap();
-    extensions::update_overrides(&mut s.local_state.extension_overrides, &installed, &ids);
-    let config_dir = s.config_dir.clone();
-    s.local_state.save(&config_dir)
+    state.lock().unwrap().update_local(|ls| {
+        extensions::update_overrides(&mut ls.extension_overrides, &installed, &ids);
+    })
 }
 
 /// One about:config pref this device could sync, for the review screen.
@@ -613,10 +669,9 @@ fn set_pref_selection_cmd(
         prefs::syncable(&content, &sine::declared_prefs(&profile_dir))
             .into_keys()
             .collect();
-    let mut s = state.lock().unwrap();
-    prefs::update_overrides(&mut s.local_state.pref_overrides, &candidates, &names);
-    let config_dir = s.config_dir.clone();
-    s.local_state.save(&config_dir)
+    state.lock().unwrap().update_local(|ls| {
+        prefs::update_overrides(&mut ls.pref_overrides, &candidates, &names);
+    })
 }
 
 #[tauri::command]
@@ -635,11 +690,10 @@ async fn set_autostart_cmd(
             .disable()
             .map_err(|e| format!("Failed to disable autostart: {e}"))?;
     }
-    {
-        let mut s = state.lock().unwrap();
-        s.local_state.autostart_enabled = enabled;
-        let config_dir = s.config_dir.clone();
-        let _ = s.local_state.save(&config_dir);
+    // The OS setting is what counts (get_status reads it); the saved copy only
+    // re-applies it at startup, so a failed save is logged, not reported.
+    if let Err(e) = state.lock().unwrap().update_local(|ls| ls.autostart_enabled = enabled) {
+        crate::zslog!("[autostart] couldn't save preference: {e}");
     }
     crate::zslog!("[autostart] set to {enabled}");
     Ok(())

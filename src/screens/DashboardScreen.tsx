@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback, type ReactNode } from "react";
+import { useState, useEffect, useCallback, useRef, type ReactNode } from "react";
+import { useRefreshOnFocus, useTick } from "../hooks/useRefreshOnFocus";
 import { bridge } from "../bridge";
 import {
   formatBytes,
@@ -30,16 +31,23 @@ export default function DashboardScreen({ status, onNavigate }: Props) {
   const [latest, setLatest] = useState<SnapshotInfo | null | undefined>(undefined);
   const [latestError, setLatestError] = useState<string | null>(null);
 
+  // Only the newest request may update "latest"; see SnapshotsScreen.
+  const requestRef = useRef(0);
   const loadLatest = useCallback(() => {
+    const request = ++requestRef.current;
     setLatestError(null);
     bridge
       .getSnapshots()
-      .then((snaps) => setLatest(snaps[0] ?? null))
-      .catch((e) => setLatestError(String(e)));
+      .then((snaps) => request === requestRef.current && setLatest(snaps[0] ?? null))
+      .catch((e) => request === requestRef.current && setLatestError(String(e)));
   }, []);
 
-  // Also re-run after a backup, which adds a snapshot.
+  // Also re-run after a backup, which adds a snapshot, and when the window
+  // regains focus, so "Restore latest backup" names what is really latest.
   useEffect(loadLatest, [loadLatest, ops.revision]);
+  useRefreshOnFocus(loadLatest);
+  // Keeps "3 minutes ago" current while the window stays open.
+  useTick(60_000);
 
   // Mods and extensions may have changed while Zen was open, or by a restore.
   useEffect(() => {
