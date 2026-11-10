@@ -1,6 +1,6 @@
 [package]
 name = "zen-sync"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2021"
 description = "Encrypted Zen Browser profile backups via GitHub"
 
