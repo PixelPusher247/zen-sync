@@ -400,7 +400,8 @@ mod tests {
     fn newer_key_file_format_is_refused() {
         let (_, _, mut file) = key_file();
         file.version = 2;
-        assert!(file.unlock("correct horse battery").unwrap_err().contains("newer"));
+        let err = file.unlock("correct horse battery").err().expect("a newer format must be refused");
+        assert!(err.contains("newer"), "{err}");
     }
 
     #[test]
