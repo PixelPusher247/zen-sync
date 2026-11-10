@@ -48,6 +48,24 @@ impl MachineMetadata {
             (self.current_index + 1) % max_snapshots
         }
     }
+
+    /// Record a snapshot just uploaded to `entry.index`, keeping at most
+    /// `max_snapshots`. Returns the slots that dropped out of the list, whose
+    /// assets can be deleted. Never includes `entry.index`: that asset is the
+    /// one just uploaded (it replaced whatever the slot held before).
+    pub fn record(&mut self, entry: SnapshotEntry, max_snapshots: u8) -> Vec<u8> {
+        let index = entry.index;
+        let before: Vec<u8> = self.snapshots.iter().map(|s| s.index).collect();
+        self.snapshots.retain(|s| s.index != index);
+        self.snapshots.insert(0, entry);
+        self.snapshots.truncate(max_snapshots as usize);
+        self.current_index = index;
+        self.max_snapshots = max_snapshots;
+        before
+            .into_iter()
+            .filter(|&i| i != index && !self.snapshots.iter().any(|s| s.index == i))
+            .collect()
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]

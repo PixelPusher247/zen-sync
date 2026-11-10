@@ -87,36 +87,16 @@ pub async fn backup(
         None => (SyncMetadata::default(), None),
     };
 
-    let machine_meta = metadata
+    let index = metadata
         .machines
-        .iter_mut()
-        .find(|m| m.machine_id == machine_id);
-
-    let (index, expired_indices) = if let Some(mm) = machine_meta {
-        let next = mm.next_index(max_snapshots);
-        // Collect indices that will be evicted (ring-buffer overflow)
-        let expired: Vec<u8> = mm
-            .snapshots
-            .iter()
-            .filter(|s| s.index == next)
-            .map(|s| s.index)
-            .collect();
-        (next, expired)
-    } else {
-        (0u8, vec![])
-    };
+        .iter()
+        .find(|m| m.machine_id == machine_id)
+        .map_or(0, |m| m.next_index(max_snapshots));
 
     on_progress("Uploading…");
     crate::zslog!("[sync] backup: uploading to slot {index} for machine '{machine_id}'");
+    // Replaces the asset already in this slot, if any.
     client.upload_snapshot(machine_id, index, &encrypted).await?;
-
-    // Delete any evicted asset
-    if !expired_indices.is_empty() {
-        on_progress("Pruning old snapshots…");
-        client
-            .delete_snapshot_assets(machine_id, &expired_indices)
-            .await?;
-    }
 
     let pushed_at = now_iso();
     let new_entry = SnapshotEntry {
@@ -127,13 +107,8 @@ pub async fn backup(
     };
 
     // Update or insert machine metadata
-    if let Some(mm) = metadata.machines.iter_mut().find(|m| m.machine_id == machine_id) {
-        // Remove existing entry for this slot, push new one at front
-        mm.snapshots.retain(|s| s.index != index);
-        mm.snapshots.insert(0, new_entry);
-        mm.snapshots.truncate(max_snapshots as usize);
-        mm.current_index = index;
-        mm.max_snapshots = max_snapshots;
+    let dropped = if let Some(mm) = metadata.machines.iter_mut().find(|m| m.machine_id == machine_id) {
+        mm.record(new_entry, max_snapshots)
     } else {
         metadata.machines.push(MachineMetadata {
             machine_id: machine_id.to_string(),
@@ -141,10 +116,18 @@ pub async fn backup(
             max_snapshots,
             current_index: index,
         });
-    }
+        Vec::new()
+    };
 
     on_progress("Saving backup list…");
     client.write_metadata(&metadata, sha.as_deref()).await?;
+
+    // Snapshots that fell out of the list, e.g. after "Snapshots to keep" was
+    // lowered. Removed only once the list no longer points at them.
+    if !dropped.is_empty() {
+        on_progress("Pruning old snapshots…");
+        client.delete_snapshot_assets(machine_id, &dropped).await?;
+    }
 
     // Only remove the old format once the new snapshot is safely stored.
     if !legacy.is_empty() {
@@ -223,6 +206,63 @@ fn prune_safety_copies(root: &Path) {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn entry(index: u8) -> SnapshotEntry {
+        SnapshotEntry {
+            index,
+            pushed_at: format!("2026-11-0{}T00:00:00Z", index + 1),
+            machine_name: "PC".into(),
+            size_bytes: 1,
+        }
+    }
+
+    /// Runs `count` backups the way `backup` does and returns the slots it
+    /// would delete after each one.
+    fn simulate(mm: &mut MachineMetadata, count: usize, max: u8) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|_| {
+                let index = mm.next_index(max);
+                mm.record(entry(index), max)
+            })
+            .collect()
+    }
+
+    fn slots(mm: &MachineMetadata) -> Vec<u8> {
+        mm.snapshots.iter().map(|s| s.index).collect()
+    }
+
+    #[test]
+    fn wrapping_around_never_deletes_the_new_snapshot() {
+        let mut mm = MachineMetadata {
+            machine_id: "pc".into(),
+            snapshots: vec![],
+            max_snapshots: 3,
+            current_index: 0,
+        };
+        mm.record(entry(0), 3);
+        // Fill the other two slots, then wrap around twice.
+        let deleted = simulate(&mut mm, 2 + 6, 3);
+        // Each slot is overwritten in place, so nothing is ever deleted.
+        assert!(deleted.iter().all(Vec::is_empty), "{deleted:?}");
+        assert_eq!(slots(&mm).len(), 3);
+        assert_eq!(slots(&mm)[0], mm.current_index);
+    }
+
+    #[test]
+    fn lowering_the_limit_deletes_only_dropped_slots() {
+        let mut mm = MachineMetadata {
+            machine_id: "pc".into(),
+            snapshots: vec![entry(2), entry(1), entry(0)],
+            max_snapshots: 3,
+            current_index: 2,
+        };
+        let index = mm.next_index(2);
+        let deleted = mm.record(entry(index), 2);
+        assert!(!deleted.contains(&index));
+        assert!(deleted.iter().all(|i| !slots(&mm).contains(i)));
+        assert_eq!(slots(&mm).len(), 2);
+        assert_eq!(deleted.len(), 1);
+    }
 
     #[test]
     fn epoch_to_iso_known() {

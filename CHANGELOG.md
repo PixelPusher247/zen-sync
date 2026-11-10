@@ -5,6 +5,24 @@ Everything that changed in Zen Sync, newest first.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] — 2026-11-10
+
+### Fixed
+
+- **Backups no longer delete themselves once a device's slots are full.**
+  When a backup reused a slot (from the fourth backup on, with the default of
+  three kept), the clean-up step after the upload deleted the snapshot that had
+  just been uploaded. History still listed it, and restoring it failed with
+  "Snapshot asset … not found". This has happened since 0.2.0.
+- Snapshots that drop off the list after lowering *Snapshots to keep* are now
+  deleted from GitHub. Before, only the backup list forgot them.
+
+### Notes
+
+- Snapshots lost this way can't be recovered. They still show in History until
+  their slot is reused by a new backup; restoring one fails. Back up again on
+  each device to replace them.
+
 ## [0.5.0] — 2026-11-09
 
 A pass over the whole interface, plus three fixes it turned up.
@@ -232,6 +250,7 @@ private GitHub repository.
   replacing profile files the browser holds open.
 - In-app update banner, system tray icon, and autostart (off by default).
 
+[0.5.1]: https://github.com/PixelPusher247/zen-sync/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/PixelPusher247/zen-sync/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/PixelPusher247/zen-sync/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/PixelPusher247/zen-sync/compare/v0.3.0...v0.3.1
