@@ -42,9 +42,7 @@ jobs:
 
       - name: cargo check
         working-directory: src-tauri
-        # --locked: fail if Cargo.lock doesn't match Cargo.toml instead of
-        # quietly rewriting it.
-        run: cargo check --locked
+        run: cargo check
 
       - name: cargo clippy
         working-directory: src-tauri
@@ -53,3 +51,10 @@ jobs:
       - name: cargo test
         working-directory: src-tauri
         run: cargo test
+
+      # Cargo rewrites Cargo.lock when it doesn't match Cargo.toml. Fail if it
+      # did, and print what it changed, so the committed lockfile stays right.
+      - name: Cargo.lock is up to date
+        if: always()
+        working-directory: src-tauri
+        run: git diff --exit-code -- Cargo.lock
