@@ -31,7 +31,7 @@ const EXTENSION_ITEMS: SyncItem[] = [
 ];
 
 const ZEN_ITEMS: SyncItem[] = [
-  { key: "zenShortcuts", label: "Zen shortcuts", description: "Workspace, compact mode and other Zen keys" },
+  { key: "zenShortcuts", label: "Zen shortcuts", description: "Keys you rebind in Zen or about:keyboard" },
   { key: "aboutConfig", label: "about:config prefs", description: "Settings you changed in about:config" },
 ];
 

@@ -5,6 +5,30 @@ Everything that changed in Zen Sync, newest first.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Zen keyboard shortcuts sync again with Zen 1.24.** Zen 1.24 moved its
+  shortcuts to Firefox's `about:keyboard`, which keeps the keys you rebind in
+  `customKeys.json`, and deleted the file Zen Sync backed up. Since then
+  backups carried no shortcuts and the dashboard showed "None saved". Backups
+  now include `customKeys.json`, and restores write it.
+
+### Notes
+
+- The dashboard now counts only the shortcuts you changed, since Zen no longer
+  keeps a list of all of them.
+- Snapshots made before Zen 1.24 still restore. On a device with Zen 1.24
+  Zen moves their shortcuts into `about:keyboard` on its next start; the
+  restore clears that device's own changed keys first, so you get exactly the
+  snapshot's shortcuts.
+- Restoring a new snapshot on a device whose Zen is still 1.23 or older (or
+  hasn't been started since updating) warns that the shortcuts may not all
+  apply until Zen is updated and started once.
+- Zen Sync 0.6.0 skips the shortcuts in snapshots this version makes on Zen
+  1.24, since it doesn't know `customKeys.json`. Snapshot format stays at 3.
+
 ## [0.6.0] — 2026-11-10
 
 ### Added

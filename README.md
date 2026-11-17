@@ -34,7 +34,7 @@ Unlike [Zync](https://github.com/PixelPusher247/zync), there are no background d
 ```
 
 1. **Backup** — Click "Back up now". Zen Sync zips your Sine mods, the values of the settings those mods declare, and the data of your selected extensions, encrypts the archive with AES-256-GCM, and uploads it as a release asset to a private `zen-sync-backup` repo in your GitHub account.
-2. **Restore** — Click "Restore latest backup" to restore the newest snapshot from any device, or open the History screen to pick an older one. Your mods folder is replaced with the snapshot's, mod settings are written into `prefs.js` one by one, and extension storage is copied in. Extension storage is tied to a per-profile UUID, so Zen Sync rewrites it to match the UUID the extension has on this device. Zen's shortcuts file is replaced and the `about:config` prefs you picked are written in. Nothing else in `prefs.js` is touched, so device name and Mozilla account stay as they are.
+2. **Restore** — Click "Restore latest backup" to restore the newest snapshot from any device, or open the History screen to pick an older one. Your mods folder is replaced with the snapshot's, mod settings are written into `prefs.js` one by one, and extension storage is copied in. Extension storage is tied to a per-profile UUID, so Zen Sync rewrites it to match the UUID the extension has on this device. Zen's keyboard shortcuts are replaced and the `about:config` prefs you picked are written in. Nothing else in `prefs.js` is touched, so device name and Mozilla account stay as they are.
 3. **Zen must be closed** — All operations are hard-blocked if Zen Browser is running, preventing database corruption and conflicting writes to files the browser holds open. The app notices within a couple of seconds when you close or open Zen.
 4. **Your passphrase unlocks the key** — On the first device you choose a backup passphrase and get a recovery code. The key that encrypts your snapshots is stored in the repository only locked with those two, so GitHub, or anyone else who can read the repository, can't decrypt your backups. Each further device asks once for the passphrase (or the recovery code) and then keeps the key in Windows Credential Manager.
 
@@ -65,7 +65,7 @@ Unlike [Zync](https://github.com/PixelPusher247/zync), there are no background d
 | Extension storage | `storage/default/moz-extension+++<uuid>^userContextId=4294967295/` (`storage.local`) |
 | Extension permissions | The extension's entry in `extension-preferences.json` |
 | Extension shortcuts | The extension's entries under `commands` in `extension-settings.json` |
-| Zen shortcuts | `zen-keyboard-shortcuts.json`, with the `zen.keyboard.shortcuts.version` pref that says which schema it is in |
+| Zen shortcuts | `customKeys.json`, the keys you rebound in Zen's Keyboard Shortcuts settings or `about:keyboard` (Zen 1.24 and newer). Zen 1.23 and older: `zen-keyboard-shortcuts.json`, with the `zen.keyboard.shortcuts.version` pref that says which schema it is in |
 | `about:config` prefs | The prefs in `prefs.js` you selected on the prefs screen |
 
 **Left to Mozilla sync:** spaces, containers, bookmarks, history, passwords, installed extensions, `storage.sync`. The Sine engine itself (`chrome/JS/`) must be installed on each device.

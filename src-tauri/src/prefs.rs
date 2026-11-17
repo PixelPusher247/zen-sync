@@ -164,7 +164,7 @@ const DEVICE_KEYS: &[&str] = &[
     "pdfjs.previousHandler.preferredAction",
     "security.sandbox.content.tempDirSuffix",
     "signon.importedFromSqlite",
-    // The Zen shortcuts option writes this one alongside the shortcuts file.
+    // The Zen shortcuts option writes this one alongside Zen 1.23's shortcuts file.
     "zen.keyboard.shortcuts.version",
 ];
 

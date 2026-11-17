@@ -208,7 +208,7 @@ export default function DashboardScreen({ status, onNavigate }: Props) {
               {options.extensionStorage && ` · ${formatBytes(summary.storageBytes)}`}
             </SummaryRow>
             <SummaryRow label="Zen shortcuts" on={options.zenShortcuts}>
-              {summary.shortcutCount > 0 ? summary.shortcutCount : "None saved"}
+              {summary.shortcutCount > 0 ? summary.shortcutCount : "None changed"}
             </SummaryRow>
             <SummaryRow label="about:config" on={options.aboutConfig}>
               {summary.prefCount === 1 ? "1 pref" : `${summary.prefCount} prefs`}

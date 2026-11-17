@@ -11,7 +11,8 @@
 //!
 //! Shortcuts and about:config prefs were added without a bump: they are extra
 //! manifest sections a 0.3.x build ignores, and it refuses any format above its
-//! own outright, which would have cost cross-version restores for nothing.
+//! own outright, which would have cost cross-version restores for nothing. The
+//! same goes for `custom_keys`, where Zen keeps its shortcuts since 1.24.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -89,9 +90,14 @@ pub struct Manifest {
     pub created_at: u64,
     pub sine: Option<SineSection>,
     pub extensions: Vec<ExtensionSection>,
-    /// Zen's keyboard shortcuts. Absent in format 2 and early format 3.
+    /// Zen's keyboard shortcuts as Zen 1.23 and older kept them. Absent in
+    /// format 2 and early format 3, and once the source ran Zen 1.24.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zen_shortcuts: Option<ShortcutsSection>,
+    /// The customised keys of Zen 1.24 and newer. Absent in snapshots from
+    /// zen-sync 0.6.0 and older.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_keys: Option<CustomKeysSection>,
     /// about:config prefs. Absent in format 2 and early format 3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub about_config: Option<AboutConfigSection>,
@@ -140,6 +146,13 @@ pub struct ShortcutsSection {
     /// `zen.keyboard.shortcuts.version` on the source device, if it was set.
     #[serde(default)]
     pub version: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct CustomKeysSection {
+    /// The whole `customKeys.json` document: key id → binding. Empty when
+    /// every key on the source was at its default.
+    pub keys: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -248,7 +261,8 @@ pub fn summarize(profile_dir: &Path, selection: &Selection) -> Result<BackupSumm
         },
         extension_count,
         storage_bytes,
-        shortcut_count: shortcuts::read(profile_dir).as_ref().map_or(0, shortcuts::count),
+        shortcut_count: shortcuts::read(profile_dir).map_or(0, |keys| keys.len())
+            + shortcuts::legacy::read(profile_dir).as_ref().map_or(0, shortcuts::legacy::count),
         pref_count: selected_prefs(&prefs_content, &declared, pref_overrides).len(),
     })
 }
@@ -374,13 +388,23 @@ pub fn build(profile_dir: &Path, selection: &Selection) -> Result<(Vec<u8>, Mani
         });
     }
 
-    let zen_shortcuts = options
+    // Zen's shortcuts: the customised keys, plus the old shortcuts file while
+    // this profile still has one (Zen 1.23 or older, or 1.24 not started yet).
+    let custom_keys = options
         .zen_shortcuts
         .then(|| shortcuts::read(profile_dir))
         .flatten()
+        .map(|keys| {
+            crate::zslog!("[bundle] {} customised keys", keys.len());
+            CustomKeysSection { keys }
+        });
+    let zen_shortcuts = options
+        .zen_shortcuts
+        .then(|| shortcuts::legacy::read(profile_dir))
+        .flatten()
         .map(|data| {
-            crate::zslog!("[bundle] {} Zen shortcuts", shortcuts::count(&data));
-            ShortcutsSection { data, version: shortcuts::version(&prefs_content) }
+            crate::zslog!("[bundle] {} Zen shortcuts (old file)", shortcuts::legacy::count(&data));
+            ShortcutsSection { data, version: shortcuts::legacy::version(&prefs_content) }
         });
 
     let about_config = options
@@ -394,11 +418,11 @@ pub fn build(profile_dir: &Path, selection: &Selection) -> Result<(Vec<u8>, Mani
             AboutConfigSection { prefs: values }
         });
 
-    if sine.is_none()
-        && extension_sections.is_empty()
-        && zen_shortcuts.is_none()
-        && about_config.is_none()
-    {
+    // Keys that are all at their default still go into a snapshot with other
+    // data, so restoring it resets them, but aren't worth one on their own.
+    let has_shortcuts =
+        zen_shortcuts.is_some() || custom_keys.as_ref().is_some_and(|c| !c.keys.is_empty());
+    if sine.is_none() && extension_sections.is_empty() && !has_shortcuts && about_config.is_none() {
         return Err("Nothing to back up: no Sine mods and no extension data found.".into());
     }
 
@@ -408,6 +432,7 @@ pub fn build(profile_dir: &Path, selection: &Selection) -> Result<(Vec<u8>, Mani
         sine,
         extensions: extension_sections,
         zen_shortcuts,
+        custom_keys,
         about_config,
     };
     zip.start_file(MANIFEST_NAME, file_options(CompressionMethod::Deflated))
@@ -540,6 +565,7 @@ pub fn apply(
         ext_storage::PERMISSIONS_FILE.to_string(),
         ext_storage::SETTINGS_FILE.to_string(),
         shortcuts::FILE.to_string(),
+        shortcuts::legacy::FILE.to_string(),
     ];
     if sine_mods.is_some() {
         to_save.push("chrome/sine-mods".into());
@@ -581,21 +607,45 @@ pub fn apply(
             );
         }
 
-        // Zen's shortcuts: the file, plus the pref that says which schema it is in.
-        if let Some(section) = manifest.zen_shortcuts.as_ref().filter(|_| options.zen_shortcuts) {
-            write_json(&shortcuts::path(profile_dir), Some(&section.data))?;
-            if let Some(version) = shortcuts::version_to_write(
-                section.version,
-                shortcuts::version(&prefs_content),
-            ) {
-                set_prefs.insert(shortcuts::VERSION_PREF.into(), version.to_string());
+        // Zen's shortcuts. customKeys.json is replaced whenever the snapshot has
+        // shortcuts at all. A snapshot from Zen 1.23 or older has only the old
+        // file, which Zen 1.24 moves into customKeys.json on its next start but
+        // without touching keys already customised there, so it gets an empty
+        // one to land in and the result is the source's keys and nothing else.
+        if options.zen_shortcuts && (manifest.custom_keys.is_some() || manifest.zen_shortcuts.is_some()) {
+            let empty = serde_json::Map::new();
+            let keys = manifest.custom_keys.as_ref().map_or(&empty, |c| &c.keys);
+            let keys_path = shortcuts::path(profile_dir);
+            // An empty file says what a missing one does; don't create one for nothing.
+            if !keys.is_empty() || keys_path.exists() {
+                write_json(&keys_path, Some(&serde_json::Value::Object(keys.clone())))?;
+            }
+            crate::zslog!("[bundle] {} customised keys", keys.len());
+
+            // The old file, plus the pref that says which schema it is in.
+            if let Some(section) = &manifest.zen_shortcuts {
+                write_json(&shortcuts::legacy::path(profile_dir), Some(&section.data))?;
+                if let Some(version) = shortcuts::legacy::version_to_write(
+                    section.version,
+                    shortcuts::legacy::version(&prefs_content),
+                ) {
+                    set_prefs.insert(shortcuts::legacy::VERSION_PREF.into(), version.to_string());
+                }
+                crate::zslog!(
+                    "[bundle] {} Zen shortcuts in the old file (snapshot schema {:?})",
+                    shortcuts::legacy::count(&section.data),
+                    section.version
+                );
+            } else if shortcuts::legacy::path(profile_dir).exists() {
+                // Zen here is older than 1.24, or hasn't started since updating.
+                // Its old file is left alone: an old Zen still runs on it, and
+                // 1.24 only takes from it the keys the restore didn't set.
+                report.warnings.push(
+                    "Zen on this device still keeps its shortcuts the way Zen 1.23 and older did, so the restored ones may not all apply until you update Zen to 1.24 or newer and start it once."
+                        .into(),
+                );
             }
             report.shortcuts_restored = true;
-            crate::zslog!(
-                "[bundle] {} Zen shortcuts (snapshot schema {:?})",
-                shortcuts::count(&section.data),
-                section.version
-            );
         }
 
         // Sine mods: mirror the snapshot, then sync the declared settings.
@@ -1325,16 +1375,30 @@ mod tests {
         assert!(err.contains("Unsupported snapshot format 4"));
     }
 
-    /// A profile with nothing but the shortcuts file and its schema pref.
-    fn shortcuts_profile(root: &Path, version: i64, key: &str) {
-        write(
-            root,
-            "prefs.js",
-            &format!("user_pref(\"{}\", {version});\n", shortcuts::VERSION_PREF),
-        );
+    /// A Zen 1.24 profile with nothing but one customised key.
+    fn custom_keys_profile(root: &Path, key: &str) {
+        write(root, "prefs.js", "");
         write(
             root,
             shortcuts::FILE,
+            &serde_json::json!({
+                "zen-workspace-switch-1": { "modifiers": "alt", "key": key }
+            })
+            .to_string(),
+        );
+    }
+
+    /// A Zen 1.23 profile with nothing but the old shortcuts file and its
+    /// schema pref.
+    fn legacy_shortcuts_profile(root: &Path, version: i64, key: &str) {
+        write(
+            root,
+            "prefs.js",
+            &format!("user_pref(\"{}\", {version});\n", shortcuts::legacy::VERSION_PREF),
+        );
+        write(
+            root,
+            shortcuts::legacy::FILE,
             &serde_json::json!({
                 "shortcuts": [
                     { "id": "zen-workspace-switch-1", "key": key, "modifiers": { "alt": true } }
@@ -1344,34 +1408,127 @@ mod tests {
         );
     }
 
+    fn custom_keys_in(profile: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(shortcuts::path(profile)).unwrap()).unwrap()
+    }
+
     #[test]
-    fn zen_shortcuts_travel_with_their_schema_version() {
+    fn customised_keys_replace_the_targets() {
         let source = tempdir().unwrap();
-        shortcuts_profile(source.path(), 20, "1");
+        custom_keys_profile(source.path(), "1");
+        let (bytes, manifest) = build(source.path(), &Selection::default()).unwrap();
+        assert_eq!(manifest.custom_keys.as_ref().unwrap().keys.len(), 1);
+        assert!(manifest.zen_shortcuts.is_none());
+
+        let target = tempdir().unwrap();
+        let t = target.path();
+        write(
+            t,
+            shortcuts::FILE,
+            r#"{"zen-workspace-switch-1":{"modifiers":"alt","key":"9"},"key_reload":{}}"#,
+        );
+
+        let report = apply(t, &bytes, &Selection::default(), tempdir().unwrap().path()).unwrap();
+        assert!(report.shortcuts_restored);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert_eq!(
+            custom_keys_in(t),
+            serde_json::json!({ "zen-workspace-switch-1": { "modifiers": "alt", "key": "1" } })
+        );
+    }
+
+    #[test]
+    fn keys_at_their_default_reset_the_targets() {
+        // Zen 1.24 writes no customKeys.json until a key is changed.
+        let empty = tempdir().unwrap();
+        write(empty.path(), "prefs.js", "");
+        assert!(build(empty.path(), &Selection::default())
+            .unwrap_err()
+            .contains("Nothing to back up"));
+
+        let source = tempdir().unwrap();
+        source_profile(source.path());
+        let (bytes, manifest) = build(source.path(), &Selection::default()).unwrap();
+        assert!(manifest.custom_keys.as_ref().unwrap().keys.is_empty());
+
+        let target = tempdir().unwrap();
+        let t = target.path();
+        custom_keys_profile(t, "9");
+        let report = apply(t, &bytes, &Selection::default(), tempdir().unwrap().path()).unwrap();
+        assert!(report.shortcuts_restored);
+        assert_eq!(custom_keys_in(t), serde_json::json!({}));
+
+        // A target without customised keys doesn't get an empty file.
+        let bare = tempdir().unwrap();
+        write(bare.path(), "prefs.js", "");
+        apply(bare.path(), &bytes, &Selection::default(), tempdir().unwrap().path()).unwrap();
+        assert!(!shortcuts::path(bare.path()).exists());
+    }
+
+    #[test]
+    fn old_zen_shortcuts_travel_with_their_schema_version() {
+        let source = tempdir().unwrap();
+        legacy_shortcuts_profile(source.path(), 20, "1");
         let (bytes, manifest) = build(source.path(), &Selection::default()).unwrap();
         let section = manifest.zen_shortcuts.as_ref().unwrap();
         assert_eq!(section.version, Some(20));
-        assert_eq!(shortcuts::count(&section.data), 1);
+        assert_eq!(shortcuts::legacy::count(&section.data), 1);
 
         // The target runs an older Zen, so the restore keeps the older schema
         // number and lets that build migrate the file forward itself.
         let target = tempdir().unwrap();
         let t = target.path();
-        shortcuts_profile(t, 18, "9");
+        legacy_shortcuts_profile(t, 18, "9");
 
         let report = apply(t, &bytes, &Selection::default(), tempdir().unwrap().path()).unwrap();
         assert!(report.shortcuts_restored);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
 
-        let restored = shortcuts::read(t).unwrap();
+        let restored = shortcuts::legacy::read(t).unwrap();
         assert_eq!(restored["shortcuts"][0]["key"], "1");
         let prefs_out = std::fs::read_to_string(t.join(PREFS_FILE)).unwrap();
-        assert_eq!(prefs::get_raw(&prefs_out, shortcuts::VERSION_PREF), Some("18"));
+        assert_eq!(prefs::get_raw(&prefs_out, shortcuts::legacy::VERSION_PREF), Some("18"));
+    }
+
+    #[test]
+    fn old_zen_shortcuts_restored_onto_zen_1_24_start_from_no_customised_keys() {
+        let source = tempdir().unwrap();
+        legacy_shortcuts_profile(source.path(), 20, "1");
+        let (bytes, _) = build(source.path(), &Selection::default()).unwrap();
+
+        // Zen 1.24 has already moved this device's old file into customKeys.json.
+        let target = tempdir().unwrap();
+        let t = target.path();
+        custom_keys_profile(t, "9");
+
+        apply(t, &bytes, &Selection::default(), tempdir().unwrap().path()).unwrap();
+        // Zen moves the restored old file in on its next start; a key left
+        // customised here would win over it.
+        assert_eq!(custom_keys_in(t), serde_json::json!({}));
+        assert_eq!(shortcuts::legacy::read(t).unwrap()["shortcuts"][0]["key"], "1");
+    }
+
+    #[test]
+    fn restore_onto_a_zen_still_on_the_old_file_keeps_it_and_warns() {
+        let source = tempdir().unwrap();
+        custom_keys_profile(source.path(), "1");
+        let (bytes, _) = build(source.path(), &Selection::default()).unwrap();
+
+        let target = tempdir().unwrap();
+        let t = target.path();
+        legacy_shortcuts_profile(t, 18, "9");
+
+        let report = apply(t, &bytes, &Selection::default(), tempdir().unwrap().path()).unwrap();
+        assert!(report.shortcuts_restored);
+        assert_eq!(custom_keys_in(t)["zen-workspace-switch-1"]["key"], "1");
+        assert_eq!(shortcuts::legacy::read(t).unwrap()["shortcuts"][0]["key"], "9");
+        assert!(report.warnings.iter().any(|w| w.contains("Zen 1.24")), "{:?}", report.warnings);
     }
 
     #[test]
     fn zen_shortcuts_are_skipped_when_the_device_does_not_sync_them() {
         let source = tempdir().unwrap();
-        shortcuts_profile(source.path(), 20, "1");
+        custom_keys_profile(source.path(), "1");
         let off = Selection {
             options: SyncOptions { zen_shortcuts: false, ..SyncOptions::default() },
             ..Selection::default()
@@ -1382,10 +1539,10 @@ mod tests {
         let (bytes, _) = build(source.path(), &Selection::default()).unwrap();
         let target = tempdir().unwrap();
         let t = target.path();
-        shortcuts_profile(t, 18, "9");
+        custom_keys_profile(t, "9");
         let report = apply(t, &bytes, &off, tempdir().unwrap().path()).unwrap();
         assert!(!report.shortcuts_restored);
-        assert_eq!(shortcuts::read(t).unwrap()["shortcuts"][0]["key"], "9");
+        assert_eq!(custom_keys_in(t)["zen-workspace-switch-1"]["key"], "9");
     }
 
     fn about_config_selection() -> Selection {
@@ -1500,7 +1657,9 @@ mod tests {
     #[test]
     fn summary_counts_shortcuts_and_syncable_prefs() {
         let dir = tempdir().unwrap();
-        shortcuts_profile(dir.path(), 20, "1");
+        // Zen 1.24, before its first start has moved the old file over.
+        legacy_shortcuts_profile(dir.path(), 20, "1");
+        write(dir.path(), shortcuts::FILE, r#"{"key_reload":{}}"#);
         write(
             dir.path(),
             "prefs.js",
@@ -1511,7 +1670,7 @@ mod tests {
             ),
         );
         let summary = summarize(dir.path(), &Selection::default()).unwrap();
-        assert_eq!(summary.shortcut_count, 1);
+        assert_eq!(summary.shortcut_count, 2);
         assert_eq!(summary.pref_count, 1);
     }
 }
