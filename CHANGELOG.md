@@ -5,7 +5,7 @@ Everything that changed in Zen Sync, newest first.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.1] — 2026-11-17
 
 ### Fixed
 
@@ -368,6 +368,7 @@ private GitHub repository.
   replacing profile files the browser holds open.
 - In-app update banner, system tray icon, and autostart (off by default).
 
+[0.6.1]: https://github.com/PixelPusher247/zen-sync/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/PixelPusher247/zen-sync/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/PixelPusher247/zen-sync/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/PixelPusher247/zen-sync/compare/v0.5.0...v0.5.1
