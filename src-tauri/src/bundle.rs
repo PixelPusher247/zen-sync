@@ -1522,7 +1522,11 @@ mod tests {
         assert!(report.shortcuts_restored);
         assert_eq!(custom_keys_in(t)["zen-workspace-switch-1"]["key"], "1");
         assert_eq!(shortcuts::legacy::read(t).unwrap()["shortcuts"][0]["key"], "9");
-        assert!(report.warnings.iter().any(|w| w.contains("Zen 1.24")), "{:?}", report.warnings);
+        assert!(
+            report.warnings.iter().any(|w| w.contains("update Zen to 1.24")),
+            "{:?}",
+            report.warnings
+        );
     }
 
     #[test]
